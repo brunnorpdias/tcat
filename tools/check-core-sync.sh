@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-PIN='e2976c0'
+PIN='123b5b1'
 TDIFF_REPO="${1:-$HOME/Projects/tdiff}"
 TCAT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tcat"
 
@@ -24,6 +24,10 @@ die() { echo "check-core-sync: $*" >&2; exit 2; }
 
 # The functions vendored verbatim. `materialize` is deliberately NOT here: tcat
 # reduces a cluster by page position, tdiff by STATUS_PRIORITY.
+#
+# `resolve_date` lives outside the marked block in both files — it needs `parser`,
+# so it has to sit after the argument parser — but it is checked all the same. The
+# two tools promising the same date arguments is only true if it cannot drift.
 FUNCS=(
   strip_section_suffix
   _strip_wiki_path
@@ -33,6 +37,7 @@ FUNCS=(
   week_span
   resolve_week_label
   _week_label_to_sunday
+  resolve_date
 )
 
 extract() {
@@ -73,7 +78,8 @@ for fn in "${FUNCS[@]}"; do
 done
 
 # Module-level constants copied alongside the functions.
-CONSTS=(_SEP_RE WIKILINK_RE _PUNCT _WEEK_SHORT_RE _WEEK_FULL_RE)
+CONSTS=(_SEP_RE WIKILINK_RE _PUNCT _WEEK_SHORT_RE _WEEK_FULL_RE
+        _ISO_RE _OFF_RE _WEEKDAY_NAMES WEEKDAYS)
 for const in "${CONSTS[@]}"; do
   a="$(grep -m1 -E "^${const}[[:space:]]*= " "$tmp/tdiff" || true)"
   b="$(grep -m1 -E "^${const}[[:space:]]*= " "$TCAT" || true)"

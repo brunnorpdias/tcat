@@ -78,6 +78,17 @@ Sibling to `tdiff`. **`tdiff` answers *what changed*; `tcat` answers *what is th
 to add plan-vs-daily columns, drift markers, or diffing of any kind; that is `tdiff`'s job
 and the separation is deliberate.
 
+**The separation now has a seam, so there is no reason to breach it.** `tdiff -E` takes
+shell commands as its two sides, so plan-vs-actual is one invocation:
+
+```bash
+tdiff -E 'tcat today -P' 'tcat today -I'
+```
+
+`tcat` needs to do nothing for this to work beyond what it already does: emit `--json`.
+Keep that envelope stable — `{"tasks": [{"status", "name", "children"}]}` — because
+`tdiff` parses it. Changing the key names is a breaking change for both tools.
+
 External dependencies: `obsidian` CLI (`read` subcommand only). Requires Python 3.11+
 (stdlib `tomllib`). No `rg` — unlike `tdiff`, `tcat` parses note source directly.
 
@@ -146,10 +157,22 @@ One executable file: `tcat`. Pipeline:
 ## Vendored core
 
 The block between `# ── Vendored task core` and `# ── End vendored core` is copied
-verbatim from `tdiff` at pinned commit **`e2976c0`**: `strip_section_suffix`,
+verbatim from `tdiff` at pinned commit **`123b5b1`**: `strip_section_suffix`,
 `WIKILINK_RE`/`_strip_wiki_path`/`normalize_wikilinks`, `_PUNCT`/`_tokens`,
 `cluster_records`, `week_span`, `_SEP_RE`, and the week-selection set
 `resolve_week_label`/`_week_label_to_sunday`/`_WEEK_SHORT_RE`/`_WEEK_FULL_RE`.
+
+**`resolve_date` is checked too, but lives outside the block** — in both files, because it
+needs `parser` and so has to follow the argument parser. It is vendored all the same: the
+promise that `tcat` and `tdiff` take the same date arguments (weekday names, `tomorrow`,
+`-N`/`+N`) is only true if it cannot drift. `_ISO_RE`, `_OFF_RE`, `_WEEKDAY_NAMES` and
+`WEEKDAYS` come with it; the latter two are deliberately one-liners, because the script's
+constant check compares a single assignment line and a multi-line `WEEKDAYS` would have
+been checked only on its first.
+
+One deliberate divergence, and it is in the caller rather than the function: `tcat`
+hard-errors on a future date without `-P`, since the daily note won't exist yet. `tdiff`
+accepts it — an empty side is a legitimate diff.
 
 **`is_same_task` is gone** — upstream folded it into `cluster_records`, which now buckets
 on the two merge keys instead of scanning all pairs. Same clusters, ~3× faster on `tdiff`'s
@@ -256,7 +279,8 @@ opposite polarity, on two tools run side by side. `-A/--all-week` collides with 
 **`-w` and `w##`, however, are copied from `tdiff` exactly.** Week *selection* has no
 polarity problem, so the two tools should take identical arguments: `w30` / `w2026-W30` as
 the positional, `-w N` as a relative offset. `resolve_week_label`, `_week_label_to_sunday`
-and both week regexes are vendored verbatim and covered by `tools/check-core-sync.sh`.
+and both week regexes are vendored verbatim and covered by `tools/check-core-sync.sh` —
+as is `resolve_date`, so day selection matches too.
 Note `-w` is an **offset**, not a week number — that is `tdiff`'s meaning and it stays.
 One divergence: `tdiff -w 0` excludes the anchor from its own week because it is diffing;
 `tcat` isn't, so `-w 0` is simply the anchor's week.

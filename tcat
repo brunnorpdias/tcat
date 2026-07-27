@@ -557,9 +557,11 @@ def restore(s):
 _ISO_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
 _OFF_RE = re.compile(r'([-+])(\d+)')
 
-WEEKDAYS = {n: i for i, n in enumerate(
-    ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'])}
-WEEKDAYS.update({n[:3]: i for n, i in list(WEEKDAYS.items())})
+# One line each so tools/check-core-sync.sh, which compares constants by their
+# assignment line, actually covers them. Both the full name and its 3-letter prefix
+# map to the same index.
+_WEEKDAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+WEEKDAYS = {n[:k]: i for i, n in enumerate(_WEEKDAY_NAMES) for k in (3, len(n))}
 
 def resolve_date(s):
     today = date.today()
