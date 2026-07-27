@@ -7,6 +7,9 @@ daily note (`<YYYY-MM-DD>`) or from the weekly planning note's (`YYYY-W##`) allo
 for that weekday. Projects are grouped, duplicates are collapsed, and rows are sorted by
 status.
 
+Two flags widen the lens to the week: `-A` merges the whole week's allocation into one
+list, and `--missio` prints the week's stated mission.
+
 Sibling to [`tdiff`](../tdiff). **`tdiff` answers *what changed*; `tcat` answers *what is
 there*.** `tcat` never compares two things — every comparison stays with `tdiff`.
 
@@ -43,6 +46,11 @@ tcat -P tuesday         # what the weekly plan allocated to that Tuesday
 tcat -P tomorrow        # tomorrow's allocation (no daily note exists yet)
 tcat 2026-03-04 --flat  # flat alphabetical list, no project grouping
 tcat -S x               # only completed tasks
+tcat -A                 # everything actually done across this whole week
+tcat -A -P              # everything the plan allocated for it
+tcat -A w30             # week 30, by number
+tcat -A -w -1           # last week
+tcat --missio           # this week's mission, verbatim
 ```
 
 ### Dates
@@ -55,6 +63,7 @@ tcat -S x               # only completed tasks
 | `tomorrow` | tomorrow (needs `-P`) |
 | `-N` / `+N` | N days before / after today |
 | `monday`…`sunday`, `mon`…`sun` | **the most recent occurrence at or before today** |
+| `w##`, `w2026-W##` | a whole week, not a day — needs `-A` or `--missio` |
 
 Weekday names resolve *backwards* on purpose. A future weekday has no tasks recorded
 yet, so resolving forwards would always come back empty. On a Monday, `tuesday` means
@@ -63,11 +72,19 @@ last Tuesday and `monday` means today.
 Asking for a future date without `-P` is an error: the daily note won't exist. Use `-P`
 to read the plan's allocation for a day that hasn't happened.
 
+`w30` names week 30 of the current year; `w2026-W30` is explicit. Both come from `tdiff`,
+verbatim, so the two tools take the same week arguments. A week isn't a day, so a bare
+`tcat w30` is an error — say what you want for it (`-A`, `-A -P` or `--missio`). The
+relative form is `-w N`: `-w -1` is last week, `-w 0` the date's own week.
+
 ### Options
 
 | Flag | Effect |
 | --- | --- |
 | `-P`, `--plan` | read the weekly note's Actio allocation for that day (the plan) instead of the daily note |
+| `-A`, `--all-week` | the whole week as one deduplicated list: the week's seven daily notes, or with `-P` the weekly note's Actio plan. The date picks the week; its weekday is ignored |
+| `-w N`, `--week-offset N` | select the week N weeks away (`-1` = last week). Only applies to `-A` and `--missio` |
+| `--missio` | print the weekly note's `### *Missio*` section verbatim instead of any tasks |
 | `-f`, `--flat` | drop project grouping, promote children to top level, sort alphabetically |
 | `-S SET` | show only these status chars; prefix `^` to invert. Overrides hidden statuses |
 | `--routines` | include `#routine` tasks (excluded by default) |
@@ -120,6 +137,67 @@ it stands. (`tdiff` instead picks by `priority`, because it is comparing across 
 
 `--flat` undoes the first two levels of that: no project headers, children promoted,
 sorted alphabetically. This is the task set `tdiff` sees for the same date.
+
+### The whole week
+
+`-A` widens the lens from a day to a week. It keeps `tcat`'s existing polarity — a bare
+date is what actually happened, `-P` is what was planned — so there are two of them:
+
+| | reads | answers |
+| --- | --- | --- |
+| `tcat -A` | the week's seven **daily notes** | what did I actually do this week |
+| `tcat -A -P` | the weekly note's **Actio** | what was this week supposed to be |
+
+Same grouping, same dedup, same sorting as a single day. Only the source widens, and the
+header shows the week:
+
+```
+$ tcat -A 2026-03-04
+
+2026-W10  ·  actual  ·  6/7 notes
+
+  [u] site migration
+      [#] confirm dns cutover window
+      [x] audit redirect map
+  [!] renew domain
+  [ ] tidy downloads folder
+
+  4 tasks  ·  1 project
+```
+
+The `6/7 notes` is the point of the header: days without a note are skipped silently, so
+a thin week is usually a week you didn't write up rather than a week you didn't work. A
+week in progress shows `2/7`.
+
+Day attribution is dropped by design — this answers *what happened this week*, not *when*.
+Dedup therefore spans the week: a task written on Monday and restated on Friday appears
+once, carrying **Friday's** status. Under `-A -P`, `promissum` and `future` stay hidden as
+elsewhere; under plain `-A`, tasks in a daily note's `**future**` bucket are dropped too —
+they are explicitly deferred work, and folding seven days' worth of them into the list
+would drown it. Single-day output still shows them.
+
+The date argument selects the *week*; its weekday is ignored, so `tcat -A tuesday` and
+`tcat -A` are identical whenever both land in the same week, and `tcat -A w30` names one
+outright. In `--json`, `weekday` is `null` for a week payload and `notes` lists exactly
+which notes were read.
+
+### The week's mission
+
+`--missio` prints the weekly note's `### *Missio*` section and nothing else — no tasks, no
+summary line. The body is reproduced **verbatim**: wikilinks, `==highlights==` and HTML
+comments are all left exactly as written, because the section is prose rather than a task
+list. Only leading and trailing blank lines are trimmed.
+
+```
+$ tcat --missio --json
+{
+  "week": "2026-W10",
+  "missio": "the week is for closing the migration.\n\nnothing else ships until it does."
+}
+```
+
+`missio` is `null` when the note is missing, has no `### *Missio*` heading, or has one with
+an empty body. Exit status is 0 in every case.
 
 ## Status order
 
@@ -220,23 +298,56 @@ no note found for '2026-W09'
 2026-W09's Actio is empty
 2026-W09 predates the day ladder: its Actio holds 36 tasks as one flat week list, not split by day
 nothing allocated to sunday in 2026-W09's Actio
+nothing allocated to any day in 2026-W09's Actio
+no daily notes found for 2026-W09
+2026-W09's 3 daily notes hold no tasks
 ```
 
-The last two are opposite signals and worth telling apart. Older weekly notes may use an
-earlier template with no `**day**` markers at all.
+The pre-ladder and nothing-allocated lines are opposite signals and worth telling apart.
+Older weekly notes may use an earlier template with no `**day**` markers at all — for `-A`
+that is the difference between a week nobody planned and a week planned in a shape this
+tool can't split.
+
+`--missio` has three of its own:
+
+```
+no note found for '2026-W09'
+2026-W09 has no ### *Missio* section
+2026-W09's Missio is empty
+```
 
 ## Known gaps
 
-Three things are deliberately unfinished. None affect day-to-day use today.
+Four things are deliberately unfinished. None affect day-to-day use today.
 
-**1. `week_span()` disagrees with the templates across a New Year.** The weekly templates
-name files with moment's `gggg[-W]ww`; `week_span()` computes the label itself. Both start
-weeks on Sunday and put week 1 on the week containing Jan 1, but the week-*year* diverges
-when a week straddles the boundary. The week of Sun 2026-12-27 contains Jan 1 2027, so
-moment names it `2027-W01` while `week_span()` yields `2026-W53` — a file that won't
-exist. This is inherited from `tdiff` and affects both tools, so it needs a **joint fix**;
-correcting it in `tcat` alone would make the two disagree about which note to read. Due
-before December 2026.
+**0. `-A` over a week before `2026-W20` over-counts.** Weekly notes only start at W20;
+before that the whole weekly structure — including the coming week's day-by-day plan —
+lived inside the Sunday daily note, wrapped in a fence. `tcat` ignores fences on purpose
+(see *How the weekly note is read*), so aggregating such a week folds that Sunday's plan
+in alongside six days of actual work. Dropping the `**future**` bucket removes the largest
+part of it; the rest stands. Fixing it properly would mean re-introducing fence tracking,
+which is the one thing that section says not to do.
+
+**1. `week_span()` disagrees with the templates across a New Year — NOT YET FIXED.** The
+weekly templates name files with moment's `gggg[-W]ww`; `week_span()` computes the label
+itself. Both start weeks on Sunday and put week 1 on the week containing Jan 1, but the
+week-*year* diverges when a week straddles the boundary. The week of Sun 2026-12-27 runs
+to Sat 2027-01-02, so moment names it `2027-W01` while `week_span()` yields `2026-W53` — a
+file that won't exist.
+
+Only the straddling week is affected; the rest of each year agrees. But week *selection*
+has made the failure quieter, so this now matters more than it did:
+
+| | across the boundary |
+| --- | --- |
+| `tcat -A` | **fine** — the seven dates are correct regardless of label; only the header reads `2026-W53` |
+| `tcat -A -P`, `tcat --missio` | **broken** — they look for `2026-W53`, which doesn't exist, and report "no note found" |
+| `tcat w2027-W01 …` | **silently wrong** — resolves to Sun 2026-12-27, then relabels itself `2026-W53` and reads that. The vault's real `2027-W01` is unreachable by name |
+
+The last row is the bad one: it fails without saying so. This is inherited from `tdiff`
+and affects both tools, so it needs a **joint fix** — `resolve_week_label` and
+`_week_label_to_sunday` are vendored from `tdiff` too, and correcting it in `tcat` alone
+would make the two disagree about which note to read. **Due before December 2026.**
 
 **2. Two behaviours are unverified because the vault has no data for them.** The vault used for testing spans a
 single quarter, which contains no New Year–straddling week and no `### *Mensis*` section. So gap 1 has never been reproduced against a real file, and the

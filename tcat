@@ -111,6 +111,26 @@ def week_span(d):
     week_num = ((sun - jan1).days + days_back) // 7 + 1
     return sun, sat, f"{sun.year}-W{week_num:02d}"
 
+_WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
+_WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
+
+def resolve_week_label(s):
+    """Return 'YYYY-W##' if s is a w## specifier, else None."""
+    m = _WEEK_FULL_RE.fullmatch(s)
+    if m:
+        return m.group(1)
+    m = _WEEK_SHORT_RE.fullmatch(s)
+    if m:
+        return f'{date.today().year}-W{int(m.group(1)):02d}'
+    return None
+
+def _week_label_to_sunday(week_label):
+    """Convert 'YYYY-W##' (US convention: week 1 contains Jan 1, weeks start Sunday)."""
+    year, week_num = int(week_label[:4]), int(week_label[6:])
+    jan1 = date(year, 1, 1)
+    days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
+    return jan1 - timedelta(days=days_back) + timedelta(weeks=week_num - 1)
+
 # ── End vendored core ─────────────────────────────────────────────────────────
 
 # DIVERGENCE from tdiff: tcat reduces a cluster by *page position*, not by
@@ -312,20 +332,70 @@ def load_config(override, error):
 
 _NOT_FOUND_RE = re.compile(r'^Error: File ".*" not found\.$')
 
-def read_note(name):
-    """Return a note's lines, or None if it doesn't resolve. Folder-agnostic:
-    `obsidian read file=` resolves a bare filename anywhere in the vault.
+# -A reads seven notes where every other mode reads one. Each call is mostly spent
+# waiting on the obsidian app, so overlapping them is most of the win; 4 workers is
+# plenty, because the app is a single process on the other end. TCAT_WORKERS=1
+# forces serial reads.
+def _env_num(name, default, cast):
+    try:
+        return cast(os.environ[name])
+    except (KeyError, ValueError):
+        return default
 
-    `obsidian` exits 0 on a missing file and prints the error to stdout when it
-    isn't attached to a TTY, so the message has to be matched explicitly."""
-    r = subprocess.run(['obsidian', 'read', f'file={name}'],
-                       capture_output=True, text=True)
+FETCH_WORKERS = max(1, _env_num('TCAT_WORKERS', 4, int))
+
+# The obsidian CLI occasionally wedges on a read that normally takes ~10ms —
+# observed in this vault, and the reason tdiff caps and retries its calls too. A
+# single-note mode would just look slow; -A makes seven calls, so the odds of
+# meeting a stalled one are seven times higher. Cap, retry, move on.
+FETCH_TIMEOUT  = _env_num('TCAT_TIMEOUT', 5.0, float)
+FETCH_ATTEMPTS = max(1, _env_num('TCAT_ATTEMPTS', 3, int))
+
+_lines_cache = {}
+
+def _read_uncached(name):
+    # stdin=DEVNULL matters: the obsidian CLI drains stdin, so without it `tcat`
+    # silently eats whatever is being piped into the script that called it.
+    for attempt in range(FETCH_ATTEMPTS):
+        try:
+            r = subprocess.run(['obsidian', 'read', f'file={name}'],
+                               capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=FETCH_TIMEOUT)
+            break
+        except subprocess.TimeoutExpired:
+            if attempt == FETCH_ATTEMPTS - 1:
+                print(f"tcat: obsidian did not answer for '{name}' after "
+                      f"{FETCH_ATTEMPTS} attempts; skipping it", file=sys.stderr)
+                return None
     if r.returncode != 0 or not r.stdout.strip():
         return None
     lines = r.stdout.splitlines()
     if _NOT_FOUND_RE.match(lines[0].strip()):
         return None
     return lines
+
+def read_note(name):
+    """Return a note's lines, or None if it doesn't resolve. Folder-agnostic:
+    `obsidian read file=` resolves a bare filename anywhere in the vault.
+
+    `obsidian` exits 0 on a missing file and prints the error to stdout when it
+    isn't attached to a TTY, so the message has to be matched explicitly."""
+    if name not in _lines_cache:
+        _lines_cache[name] = _read_uncached(name)
+    return _lines_cache[name]
+
+def prefetch(names):
+    """Warm the cache for several notes at once. Single-note modes never call this,
+    so they keep exactly the cost they had before."""
+    todo = [n for n in dict.fromkeys(names) if n not in _lines_cache]
+    if FETCH_WORKERS < 2 or len(todo) < 2:
+        for n in todo:
+            read_note(n)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
+        for n, lines in zip(todo, ex.map(_read_uncached, todo)):
+            _lines_cache[n] = lines
 
 TASK_RE = re.compile(r'^(\s*)- (\[.\]) (.+)$')
 H2_RE   = re.compile(r'^##\s+\*(\w+)\*')
@@ -336,8 +406,12 @@ MDLINK_RE = re.compile(r'\[([^\[\]]+)\]\([^()]*\)')
 # The weekly day ladder. A whitelist, never a blacklist — the weekly template
 # gains sections over time, and this is what keeps Ratio's **rationes** lines and
 # Mensis's prospect checkboxes out of every day.
-LADDER = ('promissum', 'sunday', 'monday', 'tuesday', 'wednesday',
-          'thursday', 'friday', 'saturday', 'future')
+#
+# WEEK_DAYS is the ladder's day span on its own: -A asks for all seven at once,
+# and deriving LADDER from it keeps the two from drifting apart.
+WEEK_DAYS = ('sunday', 'monday', 'tuesday', 'wednesday',
+             'thursday', 'friday', 'saturday')
+LADDER = ('promissum',) + WEEK_DAYS + ('future',)
 
 def clean_text(s):
     """Un-escape Obsidian bracket escapes, then reduce links to their display text."""
@@ -349,7 +423,7 @@ def clean_text(s):
     s = MDLINK_RE.sub(lambda m: m.group(1), s)
     return strip_section_suffix(s)
 
-def parse_note(lines, region=None, day=None, routines=False):
+def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
     """Yield (indent, status_char, name, seq) for tasks in a note.
 
     Fence-agnostic by design: ``` lines are ignored, never toggled. The weekly
@@ -357,9 +431,17 @@ def parse_note(lines, region=None, day=None, routines=False):
     `base`/`dataviewjs` block lives under ## *Recensio*, ahead of ### *Actio*.
 
     region/day: when both are given, only tasks under that ### heading and that
-    ladder marker are yielded (weekly mode). When neither is given, every task in
-    the note is yielded (daily mode).
+    ladder marker are yielded (weekly mode). `day` takes one marker name or a
+    tuple of them — WEEK_DAYS folds the whole week into one pass, which is what
+    -A -P wants. When neither is given, every task in the note is yielded (daily
+    mode).
+
+    skip_future: drop tasks sitting under a **future** marker. Only -A passes it.
+    A daily note's future bucket is fair to show for that one day, but aggregating
+    a week would fold deferred work in alongside what actually happened — and a
+    pre-split Sunday's bucket holds a whole week of it.
     """
+    days = (day,) if isinstance(day, str) else day
     cur_region = cur_day = None
     seq = 0
     for line in lines:
@@ -383,7 +465,9 @@ def parse_note(lines, region=None, day=None, routines=False):
             continue
         if not routines and '#routine' in line:
             continue
-        if region is not None and (cur_region != region or cur_day != day):
+        if skip_future and cur_day == 'future':
+            continue
+        if region is not None and (cur_region != region or cur_day not in days):
             continue
         seq += 1
         yield len(m.group(1)), m.group(2)[1], clean_text(m.group(3)), seq
@@ -419,6 +503,39 @@ def survey_region(lines, region):
         if TASK_RE.match(line) and not in_future:
             tasks += 1        # the day-list portion only, never the future bucket
     return present, tasks, markers
+
+_HEAD_RE = re.compile(r'^#{1,6}\s')
+
+def extract_section(lines, name):
+    """Return one ### section's body verbatim, or None if the heading is absent.
+
+    The body runs from the heading to the next heading of any level. Leading and
+    trailing blank lines are stripped; everything else is untouched — no link
+    cleaning, no comment stripping, no section-suffix trimming. A heading with an
+    empty body returns '', which is what tells 'no such section' apart from
+    'nothing written there yet'.
+
+    Fence-agnostic like parse_note(): ``` lines are ignored. Safe here because
+    ### *Missio* carries prose only — every fenced block in the weekly note
+    (base/dataviewjs/markdown) lives under ## *Recensio* or ### *Fixa*.
+    """
+    body, inside = [], False
+    for line in lines:
+        if inside:
+            if _HEAD_RE.match(line):
+                break
+            body.append(line)
+            continue
+        m = H3_RE.match(line)
+        if m and m.group(1).lower() == name:
+            inside = True
+    if not inside:
+        return None
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    return '\n'.join(body)
 
 # ── Grouping ──────────────────────────────────────────────────────────────────
 
@@ -467,17 +584,30 @@ def sort_key(status, name):
 
 parser = argparse.ArgumentParser(
     prog='tcat',
-    description="Show one day's tasks from an Obsidian daily or weekly note.",
+    description="Show one day's tasks from an Obsidian daily or weekly note — "
+                "or, with -A, the whole week's; or, with --missio, the week's mission.",
     epilog=(
         'Dates accept YYYY-MM-DD, "today", "yesterday", "tomorrow", "0" (today), '
         '-N / +N (e.g. -1 for yesterday), or a weekday name (monday..sunday, or '
-        'mon..sun), which resolves to its most recent occurrence at or before today.'
+        'mon..sun), which resolves to its most recent occurrence at or before today. '
+        'w## / w2026-W## names a week instead of a day (e.g. w30) and needs -A or '
+        '--missio to say what to show for it.'
     ),
 )
 parser.add_argument('date', nargs='?', default='today', help='the day to show (default: today)')
 parser.add_argument('-P', '--plan',     action='store_true',
                     help="read the weekly note's Actio allocation for that day "
                          '(the plan) instead of the daily note')
+parser.add_argument('-A', '--all-week', action='store_true',
+                    help="show the whole week as one merged, deduplicated list: the "
+                         "week's seven daily notes, or with -P the weekly note's Actio "
+                         'plan. The date picks the week; its weekday is ignored')
+parser.add_argument('-w', '--week-offset', type=str, default=None,
+                    help='select the week N weeks from the date (0 = its own week, '
+                         '-1 = the week before). Only applies to -A and --missio')
+parser.add_argument('--missio',         action='store_true',
+                    help="show the week's mission — the weekly note's ### *Missio* "
+                         "section, verbatim — instead of any tasks")
 parser.add_argument('-f', '--flat',     action='store_true',
                     help='drop project grouping and promote children to top level, '
                          'sorted alphabetically (the task set tdiff sees)')
@@ -544,13 +674,47 @@ def resolve_date(s):
             parser.error(f"invalid date: {s!r}")
     parser.error(
         f"invalid date: {s!r} (expected YYYY-MM-DD, 'today', 'yesterday', "
-        f"'tomorrow', '0', -N/+N, or a weekday name)"
+        f"'tomorrow', '0', -N/+N, a weekday name, or w##)"
     )
 
-target = resolve_date(restore(args.date))
-target_d = date.fromisoformat(target)
+# A week mode is anything whose subject is the week rather than one day.
+week_mode = args.all_week or args.missio
 
-if target_d > date.today() and not args.plan:
+# w30 / w2026-W30 name a week, not a day. There is no sensible single-day reading
+# of one, and guessing between "the week's tasks" and "the week's plan" would be
+# worse than asking.
+raw_date = restore(args.date)
+week_arg = resolve_week_label(raw_date)
+if week_arg and not week_mode:
+    parser.error(
+        f"{raw_date} names a week; add -A for its tasks, -A -P for its plan, "
+        f"or --missio for its mission"
+    )
+
+if args.week_offset is not None:
+    if not week_mode:
+        parser.error("-w/--week-offset only applies to -A or --missio")
+    if week_arg:
+        parser.error(f"cannot combine -w/--week-offset with {raw_date} — "
+                     f"both name a week")
+    try:
+        week_offset = int(restore(args.week_offset))
+    except ValueError:
+        parser.error(f"-w/--week-offset expects an integer, got {args.week_offset!r}")
+else:
+    week_offset = 0
+
+if week_arg:
+    target_d = _week_label_to_sunday(week_arg)
+    target = target_d.isoformat()
+else:
+    target = resolve_date(raw_date)
+    target_d = date.fromisoformat(target) + timedelta(days=week_offset * 7)
+    target = target_d.isoformat()
+
+# Only the daily note is bound to a past date; every week mode may well have
+# something written for a week that hasn't arrived yet.
+if target_d > date.today() and not (args.plan or week_mode):
     parser.error(
         f"{target} is in the future; a daily note won't exist yet. "
         f"Use -P to read the weekly plan's allocation for that day."
@@ -585,41 +749,117 @@ RESET  = '\033[0m'  if use_color else ''
 
 WEEKDAY_NAME = ['monday', 'tuesday', 'wednesday', 'thursday',
                 'friday', 'saturday', 'sunday'][target_d.weekday()]
-_, _, week_label = week_span(target_d)
+week_sun, _, week_label = week_span(target_d)
 
-if args.plan:
-    note_name = f'{WEEKLY_FOLDER}/{week_label}' if WEEKLY_FOLDER else week_label
-    source = week_label
-else:
-    note_name = f'{DAILY_FOLDER}/{target}' if DAILY_FOLDER else target
-    source = 'daily'
+WEEKLY_NAME = f'{WEEKLY_FOLDER}/{week_label}' if WEEKLY_FOLDER else week_label
 
-lines = read_note(note_name)
+def daily_name(d):
+    return f'{DAILY_FOLDER}/{d}' if DAILY_FOLDER else d
+
+# ── Missio ────────────────────────────────────────────────────────────────────
+#
+# Standalone: the week's mission is prose, not tasks, so this branch reads the
+# weekly note, prints, and exits before any of the task machinery is consulted.
+if args.missio:
+    lines = read_note(WEEKLY_NAME)
+    body, reason = None, None
+    if lines is None:
+        reason = f"no note found for '{WEEKLY_NAME}'"
+    else:
+        body = extract_section(lines, 'missio')
+        if body is None:
+            reason = f'{week_label} has no ### *Missio* section'
+        elif not body:
+            reason = f"{week_label}'s Missio is empty"
+            body = None
+
+    if args.json:
+        print(json.dumps({'week': week_label, 'missio': body},
+                         ensure_ascii=False, indent=2))
+        sys.exit(0)
+
+    print(f'{BOLD}{week_label}{RESET}')
+    print()
+    if body:
+        for line in body.split('\n'):
+            print(f'  {line}' if line.strip() else '')
+    elif reason and args.verbose:
+        print(f'  {DIM}{reason}{RESET}')
+    elif not args.no_summary:
+        print(f'  {DIM}nothing to show{RESET}')
+    sys.exit(0)
 
 reason = None
 records = []
-if lines is None:
-    reason = f"no note found for '{note_name}'"
-elif args.plan:
-    records = list(parse_note(lines, region='actio', day=WEEKDAY_NAME,
-                              routines=args.routines))
+notes_read = []
+
+# ── The whole week, actually done ─────────────────────────────────────────────
+#
+# -A without -P is the week-scale counterpart of a bare date: the seven daily
+# notes, merged. Missing days are ordinary — this vault averages six of seven —
+# so a gap is skipped and counted, never an error.
+if args.all_week and not args.plan:
+    source = 'daily'
+    week_names = [daily_name((week_sun + timedelta(days=i)).isoformat())
+                  for i in range(7)]
+    prefetch(week_names)
+    seq0 = 0
+    for name in week_names:
+        lines = read_note(name)
+        if lines is None:
+            continue
+        notes_read.append(name)
+        # Page order across the seven notes is what makes dedup pick the latest
+        # day's status, so seq has to keep climbing between notes rather than
+        # restarting at 0 for each one.
+        recs = list(parse_note(lines, routines=args.routines, skip_future=True))
+        records += [(i, s, n, seq0 + q) for i, s, n, q in recs]
+        seq0 += len(recs)
     if not records:
-        present, n_tasks, markers = survey_region(lines, 'actio')
-        days_seen = markers - {'promissum', 'future'}
-        if not present:
-            reason = f"{week_label} has no ### *Actio* section"
-        elif n_tasks and not days_seen:
-            reason = (f"{week_label} predates the day ladder: its Actio holds "
-                      f"{n_tasks} task{'' if n_tasks == 1 else 's'} as one flat "
-                      f"week list, not split by day")
-        elif not n_tasks:
-            reason = f"{week_label}'s Actio is empty"
+        if not notes_read:
+            reason = f'no daily notes found for {week_label}'
         else:
-            reason = f"nothing allocated to {WEEKDAY_NAME} in {week_label}'s Actio"
+            reason = (f"{week_label}'s {len(notes_read)} daily note"
+                      f"{'' if len(notes_read) == 1 else 's'} hold no tasks")
+    lines = True     # the empty-output path below only checks for a missing note
+
 else:
-    records = list(parse_note(lines, routines=args.routines))
-    if not records:
-        reason = f"{target} has no tasks"
+    if args.plan or args.all_week:
+        note_name = WEEKLY_NAME
+        source = week_label
+    else:
+        note_name = daily_name(target)
+        source = 'daily'
+
+    lines = read_note(note_name)
+    if lines is not None:
+        notes_read.append(note_name)
+
+    if lines is None:
+        reason = f"no note found for '{note_name}'"
+    elif args.plan or args.all_week:
+        records = list(parse_note(lines, region='actio',
+                                  day=WEEK_DAYS if args.all_week else WEEKDAY_NAME,
+                                  routines=args.routines))
+        if not records:
+            present, n_tasks, markers = survey_region(lines, 'actio')
+            days_seen = markers - {'promissum', 'future'}
+            if not present:
+                reason = f"{week_label} has no ### *Actio* section"
+            elif n_tasks and not days_seen:
+                reason = (f"{week_label} predates the day ladder: its Actio holds "
+                          f"{n_tasks} task{'' if n_tasks == 1 else 's'} as one flat "
+                          f"week list, not split by day")
+            elif not n_tasks:
+                reason = f"{week_label}'s Actio is empty"
+            elif args.all_week:
+                reason = f"nothing allocated to any day in {week_label}'s Actio"
+            else:
+                reason = f"nothing allocated to {WEEKDAY_NAME} in {week_label}'s Actio"
+    else:
+        records = list(parse_note(lines, routines=args.routines))
+        if not records:
+            reason = f"{target} has no tasks"
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
 
@@ -648,10 +888,12 @@ else:
 if args.json:
     print(json.dumps({
         'date': target,
-        'weekday': WEEKDAY_NAME,
+        # -A spans the whole week, so no single weekday describes the payload.
+        'weekday': None if args.all_week else WEEKDAY_NAME,
         'week': week_label,
         'source': source,
         'reason': reason,
+        'notes': notes_read,
         'tasks': [
             {'status': s, 'name': n,
              'children': None if k is None else [{'status': cs, 'name': cn} for cs, cn in k]}
@@ -660,7 +902,14 @@ if args.json:
     }, ensure_ascii=False, indent=2))
     sys.exit(0)
 
-print(f"{BOLD}{target}{RESET}  {DIM}·{RESET}  {WEEKDAY_NAME[:3]}  {DIM}·{RESET}  {CYAN}{source}{RESET}")
+if args.all_week and args.plan:
+    print(f'{BOLD}{week_label}{RESET}  {DIM}·{RESET}  {CYAN}plan{RESET}')
+elif args.all_week:
+    # Coverage is worth stating: a thin week is usually missing notes, not idle.
+    print(f'{BOLD}{week_label}{RESET}  {DIM}·{RESET}  {CYAN}actual{RESET}'
+          f'  {DIM}·{RESET}  {len(notes_read)}/7 notes')
+else:
+    print(f"{BOLD}{target}{RESET}  {DIM}·{RESET}  {WEEKDAY_NAME[:3]}  {DIM}·{RESET}  {CYAN}{source}{RESET}")
 print()
 
 leaves = 0

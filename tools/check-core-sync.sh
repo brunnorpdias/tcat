@@ -32,6 +32,8 @@ FUNCS=(
   is_same_task
   cluster_records
   week_span
+  resolve_week_label
+  _week_label_to_sunday
 )
 
 extract() {
@@ -72,9 +74,10 @@ for fn in "${FUNCS[@]}"; do
 done
 
 # Module-level constants copied alongside the functions.
-for const in '_SEP_RE' 'WIKILINK_RE' '_PUNCT'; do
-  a="$(grep -m1 "^${const} = " "$tmp/tdiff" || true)"
-  b="$(grep -m1 "^${const} = " "$TCAT" || true)"
+CONSTS=(_SEP_RE WIKILINK_RE _PUNCT _WEEK_SHORT_RE _WEEK_FULL_RE)
+for const in "${CONSTS[@]}"; do
+  a="$(grep -m1 -E "^${const}[[:space:]]*= " "$tmp/tdiff" || true)"
+  b="$(grep -m1 -E "^${const}[[:space:]]*= " "$TCAT" || true)"
   if [ -z "$b" ]; then echo "MISSING in tcat:  $const" >&2; status=1; continue; fi
   if [ "$a" != "$b" ]; then
     echo "DRIFTED: $const" >&2
@@ -85,7 +88,7 @@ for const in '_SEP_RE' 'WIKILINK_RE' '_PUNCT'; do
 done
 
 if [ "$status" -eq 0 ]; then
-  echo "check-core-sync: vendored core matches tdiff@$PIN (${#FUNCS[@]} functions, 3 constants)"
+  echo "check-core-sync: vendored core matches tdiff@$PIN (${#FUNCS[@]} functions, ${#CONSTS[@]} constants)"
 else
   echo "check-core-sync: vendored core has DRIFTED from tdiff@$PIN" >&2
 fi
