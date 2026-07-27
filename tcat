@@ -148,185 +148,109 @@ def materialize(clusters):
 
 # Populated by load_config(). Placeholder values so nothing explodes if referenced
 # before load_config() runs.
-STATUS_ORDER     = {}
+#
+# There are deliberately NO built-in ranks, colours or roles. The status vocabulary
+# describes the user's vault, not this tool, and inventing a fallback table is how
+# the old build ended up sorting by ranks nobody had chosen. With no config at all
+# tcat still runs — everything unranked and uncoloured — and says so once on stderr.
+STATUS_ORDER     = {}     # char -> rank, derived from [order].statuses position
+THEMES           = {}     # theme name -> {char: '#rrggbb'}
+FULL_ROW         = set()  # statuses whose whole row takes the colour, not just [x]
 HIDDEN_STATUSES  = set()
 PROJECT_STATUSES = set()
 DAILY_FOLDER  = ''
 WEEKLY_FOLDER = ''
+CONFIG_FOUND  = False
 
-# Built-in display ranks. Merged *under* whatever the config supplies, so a shared
-# tdiff config.toml (which has no `order`/`hide` keys) still sorts correctly.
-BUILTIN_ORDER = {
-    'u': 0,                      # urgent project
-    'i': 1,                      # important project
-    '!': 2,                      # urgent
-    '*': 3,                      # important
-    'o': 4,                      # recurrent
-    ' ': 5, '/': 5,              # task, partial
-    '#': 6, '~': 6,              # blocked / waiting, snoozed
-    '>': 7, '=': 7,              # current, paused / switch
-    '-': 8,                      # cancelled
-    'x': 9,                      # done
-    'p': 10,                     # project
-}
-BUILTIN_HIDE     = {'&', '»', '«'}   # overrun, postponed, advanced
-BUILTIN_PROJECTS = {'p', 'i', 'u'}
-UNRANKED = 99
+# Anything absent from [order].statuses sorts last, in a block, alphabetically.
+UNRANKED = 10 ** 6
 
-DEFAULT_CONFIG_TOML = '''\
-# tcat status configuration
-# Each [statuses.X] table describes one task-status character (the char inside
-# "[ ]" in a task line).
-#   order  = <int>   display rank; lower sorts first. Equal ranks are allowed and
-#                    break alphabetically. Chars omitted here fall back to tcat's
-#                    built-in rank, then to last.
-#   hide   = true    never shown; filtered after dedup, so an earlier [»] never
-#                    suppresses a later [x]. -S overrides.
-#   project = true   structural marker; opens a project group in the default view
-#                    and is dropped entirely by --flat.
-#
-# tcat also reads tdiff's config.toml when no tcat config exists, so the two tools
-# share one status table. tdiff's `priority` and `ignore` keys are ignored here:
-# tcat dedups by page position, and `ignore` is a diff-side concept.
+# Config complaints are advisory, never fatal, and never belong in a pipe: they are
+# collected here and flushed to stderr at the end, unless --json or --no-summary
+# asked for output with nothing around it.
+NOTICES = []
 
-[statuses.u]
-name = "urgent project"
-order = 0
-project = true
+def notice(msg):
+    NOTICES.append(msg)
 
-[statuses.i]
-name = "important project"
-order = 1
-project = true
+def _merge(base, overlay):
+    """Recursive dict merge; the overlay wins.
 
-[statuses."!"]
-name = "urgent"
-order = 2
-
-[statuses."*"]
-name = "important"
-order = 3
-
-[statuses.o]
-name = "recurrent"
-order = 4
-
-[statuses." "]
-name = "task"
-order = 5
-
-[statuses."/"]
-name = "partial"
-order = 5
-
-[statuses."#"]
-name = "blocked / waiting"
-order = 6
-
-[statuses."~"]
-name = "snoozed"
-order = 6
-
-[statuses.">"]
-name = "current"
-order = 7
-
-[statuses."="]
-name = "paused / switch"
-order = 7
-
-[statuses."-"]
-name = "cancelled"
-order = 8
-
-[statuses.x]
-name = "done"
-order = 9
-
-[statuses.p]
-name = "project"
-order = 10
-project = true
-
-[statuses."&"]
-name = "overrun"
-hide = true
-
-[statuses."»"]
-name = "postponed"
-hide = true
-
-[statuses."«"]
-name = "advanced"
-hide = true
-
-[vault]
-# Optional. If set (non-empty), daily/weekly lookups are prefixed with this
-# folder. If empty/omitted (default), files resolve by name anywhere in the vault.
-daily_folder = ""
-weekly_folder = ""
-'''
+    Lists replace wholesale rather than concatenating: an overlay that names a
+    partial [order].statuses means exactly that order, not an insertion into a
+    lower layer's list.
+    """
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v)
+        else:
+            base[k] = v
 
 def _xdg_base():
     xdg = os.environ.get('XDG_CONFIG_HOME')
     return Path(xdg) if xdg else Path.home() / '.config'
 
-def config_path(override):
-    """Resolve the config path. Returns (path, should_bootstrap).
+def config_paths(override):
+    """Every config source, lowest precedence first.
 
-    Chain: --config -> $TCAT_CONFIG -> tcat/config.toml -> tdiff/config.toml
-    (read-only fallback) -> bootstrap tcat/config.toml.
+    The status table describes the vault's notation, not this tool, so its home is
+    obsidian-tasks/ — a directory neither tcat nor tdiff owns, which is what lets
+    the two share one table without either depending on the other being installed.
+    tcat's own directory is an optional overlay for tcat-only settings.
+
+    Each source *merges* over the ones below it, including $TCAT_CONFIG and
+    --config. A partial file must never erase what a lower layer set.
     """
-    if override:
-        return Path(override), False
+    base = _xdg_base()
+    paths = [base / 'obsidian-tasks' / 'statuses.toml',
+             base / 'tcat' / 'config.toml']
     env = os.environ.get('TCAT_CONFIG')
     if env:
-        return Path(env), False
-    base = _xdg_base()
-    own = base / 'tcat' / 'config.toml'
-    if own.exists():
-        return own, False
-    shared = base / 'tdiff' / 'config.toml'
-    if shared.exists():
-        return shared, False     # read-only: never bootstrap, never warn
-    return own, True
+        paths.append(Path(env))
+    if override:
+        paths.append(Path(override))
+    return paths
 
 def load_config(override, error):
-    """Load the status/vault table, bootstrapping tcat's own config only when neither
-    a tcat nor a tdiff config exists. Populates the module-level globals."""
-    global STATUS_ORDER, HIDDEN_STATUSES, PROJECT_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER
-    path, bootstrap = config_path(override)
-    if bootstrap:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(DEFAULT_CONFIG_TOML)
-        print(f"tcat: created default config at {path}", file=sys.stderr)
-    if not path.exists():
-        error(f"config not found: {path}")
-        return
-    try:
-        with path.open('rb') as f:
-            data = tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        error(f"invalid config at {path}: {e}")
-        return
+    """Merge every config layer and populate the module-level globals.
 
-    statuses = data.get('statuses', {})
-    # Merge over built-ins rather than replacing: a shared tdiff config.toml has
-    # neither `order` nor `hide`, and a missing rank must not collapse to 0.
-    STATUS_ORDER     = dict(BUILTIN_ORDER)
-    HIDDEN_STATUSES  = set(BUILTIN_HIDE)
-    PROJECT_STATUSES = set(BUILTIN_PROJECTS)
-    for c, v in statuses.items():
-        if 'order' in v:
-            STATUS_ORDER[c] = v['order']
-        if 'hide' in v:
-            (HIDDEN_STATUSES.add if v['hide'] else HIDDEN_STATUSES.discard)(c)
-        if 'project' in v:
-            (PROJECT_STATUSES.add if v['project'] else PROJECT_STATUSES.discard)(c)
+    Never bootstraps a file and never fails on a missing one: no config is a valid
+    (if uncoloured) state, reported once by notice(). Only unparseable TOML is an
+    error.
+    """
+    global STATUS_ORDER, THEMES, FULL_ROW, HIDDEN_STATUSES, PROJECT_STATUSES
+    global DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
 
-    vault = data.get('vault', {})
+    merged = {}
+    for path in config_paths(override):
+        if not path.exists():
+            continue
+        try:
+            with path.open('rb') as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            error(f'invalid config at {path}: {e}')
+            return
+        CONFIG_FOUND = True
+        _merge(merged, data)
+
+    # Rank is list position, so ties cannot be expressed and reordering is a move.
+    statuses = merged.get('order', {}).get('statuses', [])
+    STATUS_ORDER = {c: i for i, c in enumerate(statuses)}
+
+    THEMES = {name: dict(table)
+              for name, table in merged.get('theme', {}).items()
+              if isinstance(table, dict)}
+
+    roles = merged.get('roles', {})
+    PROJECT_STATUSES = set(roles.get('project', []))
+    HIDDEN_STATUSES  = set(roles.get('hide', []))
+    FULL_ROW         = set(roles.get('full_row', []))
+
+    vault = merged.get('vault', {})
     DAILY_FOLDER  = vault.get('daily_folder', '')
     WEEKLY_FOLDER = vault.get('weekly_folder', '')
+
 
 # ── Note reading ──────────────────────────────────────────────────────────────
 
@@ -472,38 +396,6 @@ def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
         seq += 1
         yield len(m.group(1)), m.group(2)[1], clean_text(m.group(3)), seq
 
-def survey_region(lines, region):
-    """Return (region_present, task_count, day_markers_seen) for one ### region.
-
-    Used to tell three empty results apart: the region is missing, the week is
-    genuinely empty, or the note predates the day ladder (older weekly notes list
-    Actio as one flat week list with no **day** markers at all).
-    """
-    cur, in_future = None, False
-    present, tasks, markers = False, 0, set()
-    for line in lines:
-        if H2_RE.match(line):
-            cur, in_future = None, False
-            continue
-        m = H3_RE.match(line)
-        if m:
-            cur = m.group(1).lower()
-            in_future = False
-            if cur == region:
-                present = True
-            continue
-        if cur != region:
-            continue
-        m = MARK_RE.match(line)
-        if m and m.group(1) in LADDER:
-            markers.add(m.group(1))
-            if m.group(1) == 'future':
-                in_future = True
-            continue
-        if TASK_RE.match(line) and not in_future:
-            tasks += 1        # the day-list portion only, never the future bucket
-    return present, tasks, markers
-
 _HEAD_RE = re.compile(r'^#{1,6}\s')
 
 def extract_section(lines, name):
@@ -618,8 +510,6 @@ parser.add_argument('-S', '--status',   type=str, default=None,
                          "like a flag to argparse; use -S=- or quote in a set ('x-')")
 parser.add_argument('--routines',       action='store_true', help='include #routine tasks')
 parser.add_argument('--json',           action='store_true', help='machine-readable output')
-parser.add_argument('-v', '--verbose',  action='store_true',
-                    help='report why the output was empty')
 parser.add_argument('--no-color',       action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',     action='store_true', help='suppress the summary line')
 parser.add_argument('--config',         type=str, default=None,
@@ -633,6 +523,12 @@ safe = [('__NEG__' + a[1:]) if re.fullmatch(r'-\d+', a) else a for a in raw]
 args = parser.parse_args(safe)
 
 load_config(args.config, parser.error)
+
+# No config is a valid state, not an error: tcat runs with everything unranked and
+# uncoloured rather than inventing ranks the user never chose. It just says so.
+if not CONFIG_FOUND:
+    notice('no status config found — showing unranked and uncoloured.\n'
+           '      see statuses.example.toml and config.example.toml')
 
 def restore(s):
     if s.startswith('__NEG__'):
@@ -739,11 +635,95 @@ def status_match(ch):
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
-use_color = not args.no_color and sys.stdout.isatty()
-CYAN   = '\033[36m' if use_color else ''
-DIM    = '\033[2m'  if use_color else ''
-BOLD   = '\033[1m'  if use_color else ''
-RESET  = '\033[0m'  if use_color else ''
+def _sgr(spec):
+    """'#rrggbb' -> 24-bit SGR foreground. Returns '' for anything unusable."""
+    s = str(spec).strip().lstrip('#')
+    if len(s) != 6:
+        return ''
+    try:
+        r, g, b = (int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return ''
+    return f'\033[38;2;{r};{g};{b}m'
+
+def _pick_theme():
+    """Which palette to use.
+
+    Terminals don't reliably report their background colour, so an env var settles
+    it: $TCAT_THEME, else the COLORFGBG most terminals set, else dark. Querying via
+    OSC 11 would need raw-tty mode and a stdin round-trip — and stdin handling here
+    is already delicate enough to require stdin=DEVNULL on every subprocess call
+    (see _read_uncached), so it isn't worth the fragility.
+    """
+    t = os.environ.get('TCAT_THEME', '').strip().lower()
+    if t in ('light', 'dark'):
+        return t
+    fgbg = os.environ.get('COLORFGBG', '')
+    if ';' in fgbg:
+        bg = fgbg.rsplit(';', 1)[-1].strip()
+        # The conventional reading: 7 and 9-15 are light background slots, 8 is not.
+        if bg.isdigit():
+            return 'light' if int(bg) >= 7 and int(bg) != 8 else 'dark'
+    return 'dark'
+
+use_color = not args.no_color and not args.json and sys.stdout.isatty()
+DIM   = '\033[2m' if use_color else ''
+RESET = '\033[0m' if use_color else ''
+
+THEME = _pick_theme()
+STATUS_SGR = {}          # char -> SGR escape; absent means default foreground
+if use_color:
+    for _ch, _hex in THEMES.get(THEME, {}).items():
+        _esc = _sgr(_hex)
+        if _esc:
+            STATUS_SGR[_ch] = _esc
+        else:
+            notice(f'ignoring unusable colour {_hex!r} for status {_ch!r}')
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+
+def row(status, name, indent):
+    """One task line.
+
+    Only the status symbol is coloured — a wall of tinted prose is harder to read
+    than a column of tinted markers. The exception is `full_row` (done, cancelled):
+    those take the colour across the whole line, so grey carries two distinct
+    signals — a grey marker means deprioritised but open, a grey line means settled.
+    """
+    c = STATUS_SGR.get(status, '')
+    if not c:
+        return f'{indent}[{status}] {name}'
+    if status in FULL_ROW:
+        return f'{indent}{c}[{status}] {name}{RESET}'
+    return f'{indent}{c}[{status}]{RESET} {name}'
+
+def footer(contents, mode, note_field):
+    """The one line of context, always `contents · mode · file(s)`."""
+    return f'  {DIM}' + '  ·  '.join([contents, mode, note_field]) + RESET
+
+def flush_notices():
+    """Config complaints, on stderr, at the end.
+
+    --json and --no-summary both mean "output with nothing around it", so they
+    silence these; stderr keeps them out of a pipe either way.
+    """
+    if args.json or args.no_summary:
+        return
+    for m in NOTICES:
+        print(f'tcat: {m}', file=sys.stderr)
+
+def report_unlisted(statuses):
+    """Flag statuses that appeared in a note but are absent from [order].statuses.
+
+    They still render — unranked, at the bottom, uncoloured — but silently doing so
+    would look like a sort bug rather than a gap in the config.
+    """
+    if not CONFIG_FOUND:
+        return
+    missing = sorted(s for s in statuses if s not in STATUS_ORDER)
+    if missing:
+        shown = ' '.join(f'[{s}]' for s in missing)
+        notice(f'not in [order].statuses, so shown last and uncoloured: {shown}')
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
@@ -762,34 +742,27 @@ def daily_name(d):
 # weekly note, prints, and exits before any of the task machinery is consulted.
 if args.missio:
     lines = read_note(WEEKLY_NAME)
-    body, reason = None, None
-    if lines is None:
-        reason = f"no note found for '{WEEKLY_NAME}'"
-    else:
-        body = extract_section(lines, 'missio')
-        if body is None:
-            reason = f'{week_label} has no ### *Missio* section'
-        elif not body:
-            reason = f"{week_label}'s Missio is empty"
-            body = None
+    body = extract_section(lines, 'missio') if lines is not None else None
+    body = body or None      # '' (heading present, nothing written) reads as absent
 
     if args.json:
         print(json.dumps({'week': week_label, 'missio': body},
                          ensure_ascii=False, indent=2))
         sys.exit(0)
 
-    print(f'{BOLD}{week_label}{RESET}')
-    print()
     if body:
         for line in body.split('\n'):
             print(f'  {line}' if line.strip() else '')
-    elif reason and args.verbose:
-        print(f'  {DIM}{reason}{RESET}')
     elif not args.no_summary:
         print(f'  {DIM}nothing to show{RESET}')
+    if not args.no_summary:
+        # Prose isn't countable, but every mode keeps all three footer fields so
+        # the shape never changes: contents · mode · file.
+        print()
+        print(footer('text', 'missio', week_label))
+    flush_notices()
     sys.exit(0)
 
-reason = None
 records = []
 notes_read = []
 
@@ -815,51 +788,31 @@ if args.all_week and not args.plan:
         recs = list(parse_note(lines, routines=args.routines, skip_future=True))
         records += [(i, s, n, seq0 + q) for i, s, n, q in recs]
         seq0 += len(recs)
-    if not records:
-        if not notes_read:
-            reason = f'no daily notes found for {week_label}'
-        else:
-            reason = (f"{week_label}'s {len(notes_read)} daily note"
-                      f"{'' if len(notes_read) == 1 else 's'} hold no tasks")
-    lines = True     # the empty-output path below only checks for a missing note
+    # -A never opens the weekly note, so the file field names the week and states
+    # how much of it was actually on disk.
+    mode, note_field = 'all', f'{week_label} ({len(notes_read)}/7 dailies)'
 
 else:
     if args.plan or args.all_week:
         note_name = WEEKLY_NAME
         source = week_label
+        # The weekly note is what gets read, so it — not the invoked day — is the
+        # file this output came from.
+        mode, note_field = ('all plan' if args.all_week else 'plan'), week_label
     else:
         note_name = daily_name(target)
         source = 'daily'
+        mode, note_field = 'daily', target
 
     lines = read_note(note_name)
     if lines is not None:
         notes_read.append(note_name)
-
-    if lines is None:
-        reason = f"no note found for '{note_name}'"
-    elif args.plan or args.all_week:
-        records = list(parse_note(lines, region='actio',
-                                  day=WEEK_DAYS if args.all_week else WEEKDAY_NAME,
-                                  routines=args.routines))
-        if not records:
-            present, n_tasks, markers = survey_region(lines, 'actio')
-            days_seen = markers - {'promissum', 'future'}
-            if not present:
-                reason = f"{week_label} has no ### *Actio* section"
-            elif n_tasks and not days_seen:
-                reason = (f"{week_label} predates the day ladder: its Actio holds "
-                          f"{n_tasks} task{'' if n_tasks == 1 else 's'} as one flat "
-                          f"week list, not split by day")
-            elif not n_tasks:
-                reason = f"{week_label}'s Actio is empty"
-            elif args.all_week:
-                reason = f"nothing allocated to any day in {week_label}'s Actio"
-            else:
-                reason = f"nothing allocated to {WEEKDAY_NAME} in {week_label}'s Actio"
-    else:
-        records = list(parse_note(lines, routines=args.routines))
-        if not records:
-            reason = f"{target} has no tasks"
+        if args.plan or args.all_week:
+            records = list(parse_note(lines, region='actio',
+                                      day=WEEK_DAYS if args.all_week else WEEKDAY_NAME,
+                                      routines=args.routines))
+        else:
+            records = list(parse_note(lines, routines=args.routines))
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
 
@@ -892,7 +845,6 @@ if args.json:
         'weekday': None if args.all_week else WEEKDAY_NAME,
         'week': week_label,
         'source': source,
-        'reason': reason,
         'notes': notes_read,
         'tasks': [
             {'status': s, 'name': n,
@@ -902,37 +854,35 @@ if args.json:
     }, ensure_ascii=False, indent=2))
     sys.exit(0)
 
-if args.all_week and args.plan:
-    print(f'{BOLD}{week_label}{RESET}  {DIM}·{RESET}  {CYAN}plan{RESET}')
-elif args.all_week:
-    # Coverage is worth stating: a thin week is usually missing notes, not idle.
-    print(f'{BOLD}{week_label}{RESET}  {DIM}·{RESET}  {CYAN}actual{RESET}'
-          f'  {DIM}·{RESET}  {len(notes_read)}/7 notes')
-else:
-    print(f"{BOLD}{target}{RESET}  {DIM}·{RESET}  {WEEKDAY_NAME[:3]}  {DIM}·{RESET}  {CYAN}{source}{RESET}")
-print()
-
 leaves = 0
+seen_statuses = set()
 for status, name, kids in rows:
-    print(f"  [{status}] {name}")
+    seen_statuses.add(status)
+    print(row(status, name, '  '))
     if kids is None:
         leaves += 1
         continue
     for cs, cn in kids:
-        print(f"      [{cs}] {cn}")
+        seen_statuses.add(cs)
+        print(row(cs, cn, '      '))
         leaves += 1
 
 if not rows:
-    if reason and args.verbose:
-        print(f"  {DIM}{reason}{RESET}")
-    elif not args.no_summary:
+    if not args.no_summary:
         print(f"  {DIM}nothing to show{RESET}")
+    flush_notices()
     sys.exit(0)
+
+report_unlisted(seen_statuses)
 
 if not args.no_summary:
     groups = sum(1 for _, _, k in rows if k is not None)
-    parts = [f"{leaves} task" + ('' if leaves == 1 else 's')]
+    contents = f"{leaves} task" + ('' if leaves == 1 else 's')
     if groups:
-        parts.append(f"{groups} project" + ('' if groups == 1 else 's'))
+        # Projects join `contents` rather than taking a field of their own, so the
+        # footer is always exactly three fields wide.
+        contents += f", {groups} project" + ('' if groups == 1 else 's')
     print()
-    print('  ' + f"  {DIM}·{RESET}  ".join(parts))
+    print(footer(contents, mode, note_field))
+
+flush_notices()

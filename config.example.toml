@@ -1,91 +1,38 @@
-# tcat status configuration
-# Each [statuses.X] table describes one task-status character (the char inside
-# "[ ]" in a task line).
-#   order  = <int>   display rank; lower sorts first. Equal ranks are allowed and
-#                    break alphabetically. Chars omitted here fall back to tcat's
-#                    built-in rank, then to last.
-#   hide   = true    never shown; filtered after dedup, so an earlier [»] never
-#                    suppresses a later [x]. -S overrides.
-#   project = true   structural marker; opens a project group in the default view
-#                    and is dropped entirely by --flat.
+# tcat-only settings.
 #
-# tcat also reads tdiff's config.toml when no tcat config exists, so the two tools
-# share one status table. tdiff's `priority` and `ignore` keys are ignored here:
-# tcat dedups by page position, and `ignore` is a diff-side concept.
+# Install to ~/.config/tcat/config.toml. Entirely optional: this file is an
+# *overlay* on statuses.example.toml (installed at
+# ~/.config/obsidian-tasks/statuses.toml), not a replacement for it.
+#
+# Layers, lowest precedence first — each merges over the ones below it, so a
+# partial file here never erases what the shared table set:
+#
+#   1. ~/.config/obsidian-tasks/statuses.toml   the shared vault vocabulary
+#   2. ~/.config/tcat/config.toml               this file
+#   3. $TCAT_CONFIG
+#   4. --config <path>
+#
+# There is no built-in layer beneath these. With none of them present tcat runs
+# unranked and uncoloured, and says so once on stderr.
 
-[statuses.u]
-name = "urgent project"
-order = 0
-project = true
-
-[statuses.i]
-name = "important project"
-order = 1
-project = true
-
-[statuses."!"]
-name = "urgent"
-order = 2
-
-[statuses."*"]
-name = "important"
-order = 3
-
-[statuses.o]
-name = "recurrent"
-order = 4
-
-[statuses." "]
-name = "task"
-order = 5
-
-[statuses."/"]
-name = "partial"
-order = 5
-
-[statuses."#"]
-name = "blocked / waiting"
-order = 6
-
-[statuses."~"]
-name = "snoozed"
-order = 6
-
-[statuses.">"]
-name = "current"
-order = 7
-
-[statuses."="]
-name = "paused / switch"
-order = 7
-
-[statuses."-"]
-name = "cancelled"
-order = 8
-
-[statuses.x]
-name = "done"
-order = 9
-
-[statuses.p]
-name = "project"
-order = 10
-project = true
-
-[statuses."&"]
-name = "overrun"
-hide = true
-
-[statuses."»"]
-name = "postponed"
-hide = true
-
-[statuses."«"]
-name = "advanced"
-hide = true
 
 [vault]
-# Optional. If set (non-empty), daily/weekly lookups are prefixed with this
-# folder. If empty/omitted (default), files resolve by name anywhere in the vault.
+# Optional. If set (non-empty), daily/weekly lookups are prefixed with this folder.
+# If empty or omitted, files resolve by name anywhere in the vault — which is how
+# `obsidian read file=` behaves natively, so leaving these empty is usually right.
 daily_folder = ""
 weekly_folder = ""
+
+
+# Anything from statuses.toml can be overridden here when you want tcat to differ
+# from the shared table. Lists replace wholesale rather than merging element-wise:
+# naming a partial [order].statuses means exactly that order.
+#
+# [order]
+# statuses = ["!", "*", " ", "x"]
+#
+# [theme.dark]
+# "!" = "#ff0000"
+#
+# [roles]
+# hide = []          # show overrun/postponed/advanced by default

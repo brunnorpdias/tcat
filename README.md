@@ -17,6 +17,21 @@ File lookups are folder-agnostic: notes resolve by filename anywhere in the vaul
 an Obsidian wikilink), so `tcat` doesn't care which folder your notes live in. See
 [Configuration](#configuration) to pin explicit folders.
 
+## Breaking changes
+
+The output and configuration were reworked. If you used an earlier build:
+
+- **Config moved and changed shape.** The status table now lives at
+  `~/.config/obsidian-tasks/statuses.toml` and uses grouped `[order]` / `[theme.*]` /
+  `[roles]` blocks instead of per-status `[statuses.X]` tables. `~/.config/tdiff/config.toml`
+  is **no longer read**. See [Configuration](#configuration).
+- **There are no built-in status ranks.** Order comes from config or not at all; with no
+  config `tcat` runs unranked and uncoloured and says so once on stderr.
+- **`-v` is gone**, along with the per-reason explanations of an empty result. Empty output
+  is always `nothing to show`. The `reason` key is gone from `--json` too.
+- **The header moved to the bottom.** Output now starts with the first task; context lives
+  in a single footer line. `--no-summary` suppresses that whole line, date included.
+
 ## Requirements
 
 - Python 3.11+ (stdlib `tomllib` for config parsing)
@@ -89,18 +104,17 @@ relative form is `-w N`: `-w -1` is last week, `-w 0` the date's own week.
 | `-S SET` | show only these status chars; prefix `^` to invert. Overrides hidden statuses |
 | `--routines` | include `#routine` tasks (excluded by default) |
 | `--json` | machine-readable output |
-| `-v` | explain *why* the output was empty |
 | `--no-color`, `--no-summary`, `--config PATH` | as in `tdiff` |
 
 `-S -` looks like a flag to argparse; use `-S=-` or fold it into a set (`-S 'x-'`).
+
+`--no-summary` drops the entire footer — counts *and* context. That is what you want when
+piping; use `--json` when you want the context in a parseable form.
 
 ## Output
 
 ```
 $ tcat 2026-03-04
-
-2026-03-04  ·  wed  ·  daily
-
   [u] site migration
       [/] draft rollback plan
       [#] confirm dns cutover window
@@ -114,8 +128,23 @@ $ tcat 2026-03-04
   [ ] tidy downloads folder
   [x] cancel the old subscription
 
-  12 tasks  ·  2 projects
+  12 tasks, 2 projects  ·  daily  ·  2026-03-04
 ```
+
+Tasks start on the first line. Everything contextual sits in one dim footer, always
+`contents  ·  mode  ·  file(s)`:
+
+| invocation | footer |
+| --- | --- |
+| `tcat 2026-03-04` | `12 tasks, 2 projects  ·  daily  ·  2026-03-04` |
+| `tcat -P` | `5 tasks  ·  plan  ·  2026-W10` |
+| `tcat -A` | `38 tasks  ·  all  ·  2026-W10 (6/7 dailies)` |
+| `tcat -A -P` | `31 tasks  ·  all plan  ·  2026-W10` |
+| `tcat --missio` | `text  ·  missio  ·  2026-W10` |
+
+The file field names **what was actually read**, which is why `-P` shows the weekly note
+rather than the day you asked about, and why `-A` — which never opens the weekly note —
+names the week and states its coverage.
 
 That note wrote `site migration` under four different blocks; the four children above
 are all of them, collapsed into one group.
@@ -138,6 +167,19 @@ it stands. (`tdiff` instead picks by `priority`, because it is comparing across 
 `--flat` undoes the first two levels of that: no project headers, children promoted,
 sorted alphabetically. This is the task set `tdiff` sees for the same date.
 
+### Colour
+
+Only the status marker is coloured; task names stay in the terminal's default foreground.
+A wall of tinted prose is harder to read than a column of tinted markers.
+
+The exception is done and cancelled, which take their colour across the **whole row**. So
+grey carries two distinct signals: a grey *marker* means deprioritised but still open, a
+grey *line* means settled and done with.
+
+Colours are entirely config-driven, with separate light and dark palettes — see
+[Configuration](#configuration). A status with no colour configured renders plain, which
+is the right answer for the most common ones.
+
 ### The whole week
 
 `-A` widens the lens from a day to a week. It keeps `tcat`'s existing polarity — a bare
@@ -149,25 +191,22 @@ date is what actually happened, `-P` is what was planned — so there are two of
 | `tcat -A -P` | the weekly note's **Actio** | what was this week supposed to be |
 
 Same grouping, same dedup, same sorting as a single day. Only the source widens, and the
-header shows the week:
+footer names the week:
 
 ```
 $ tcat -A 2026-03-04
-
-2026-W10  ·  actual  ·  6/7 notes
-
   [u] site migration
       [#] confirm dns cutover window
       [x] audit redirect map
   [!] renew domain
   [ ] tidy downloads folder
 
-  4 tasks  ·  1 project
+  4 tasks, 1 project  ·  all  ·  2026-W10 (6/7 dailies)
 ```
 
-The `6/7 notes` is the point of the header: days without a note are skipped silently, so
-a thin week is usually a week you didn't write up rather than a week you didn't work. A
-week in progress shows `2/7`.
+The `6/7 dailies` is the point: days without a note are skipped silently, so a thin week
+is usually a week you didn't write up rather than a week you didn't work. A week in
+progress shows `2/7`.
 
 Day attribution is dropped by design — this answers *what happened this week*, not *when*.
 Dedup therefore spans the week: a task written on Monday and restated on Friday appears
@@ -183,10 +222,24 @@ which notes were read.
 
 ### The week's mission
 
-`--missio` prints the weekly note's `### *Missio*` section and nothing else — no tasks, no
-summary line. The body is reproduced **verbatim**: wikilinks, `==highlights==` and HTML
-comments are all left exactly as written, because the section is prose rather than a task
-list. Only leading and trailing blank lines are trimmed.
+`--missio` prints the weekly note's `### *Missio*` section and nothing else — no tasks.
+The body is reproduced **verbatim**: wikilinks, `==highlights==` and HTML comments are all
+left exactly as written, because the section is prose rather than a task list. Only leading
+and trailing blank lines are trimmed.
+
+It keeps the same three-field footer as every other mode. Prose isn't countable, so the
+`contents` field is the literal word `text`:
+
+```
+$ tcat --missio
+  the week is for closing the migration.
+
+  nothing else ships until it does.
+
+  text  ·  missio  ·  2026-W10
+```
+
+The JSON form is minimal — deliberately not the task envelope:
 
 ```
 $ tcat --missio --json
@@ -201,68 +254,91 @@ an empty body. Exit status is 0 in every case.
 
 ## Status order
 
-Rows sort by status rank first, then alphabetically. Equal ranks are allowed.
+Rows sort by status rank first, then alphabetically. **There are no built-in ranks** — the
+order comes from `[order].statuses`, a single ordered list where rank *is* position. Ties
+cannot be expressed and reordering means moving a string.
 
-| Rank | Chars | |
-| --- | --- | --- |
-| 0 | `u` | urgent project |
-| 1 | `i` | important project |
-| 2 | `!` | urgent |
-| 3 | `*` | important |
-| 4 | `o` | recurrent |
-| 5 | `␣` `/` | task, partial |
-| 6 | `#` `~` | blocked / waiting, snoozed |
-| 7 | `>` `=` | current, paused / switch |
-| 8 | `-` | cancelled |
-| 9 | `x` | done |
-| 10 | `p` | project |
+The shipped default, and the colour groups it produces:
 
-`&` (overrun), `»` (postponed) and `«` (advanced) are **hidden**. Hiding happens *after*
-dedup, so an earlier `[»]` never suppresses a later `[x]` — only a task whose *final*
-state is one of these disappears. `-S` overrides.
+| # | Chars | | Colour |
+| --- | --- | --- | --- |
+| 0-1 | `u` `!` | urgent project, urgent | purple |
+| 2-3 | `i` `*` | important project, important | gold |
+| 4-6 | `>` `=` `o` | current, paused / switch, recurrent | blue |
+| 7-8 | `p` `␣` | project, task | *none* |
+| 9-14 | `/` `#` `~` `&` `»` `«` | partial, blocked, snoozed, overrun, postponed, advanced | grey |
+| 15-16 | `-` `x` | cancelled, done | grey, **whole row** |
+| — | *anything else* | | *none*, sorted last |
+
+The sequence is arranged so colour groups stay contiguous — `p` and `␣` are the deliberate
+uncoloured island between the blue and grey blocks.
+
+A status that appears in a note but not in `[order].statuses` still renders: unranked, at
+the bottom, uncoloured. `tcat` names it once on stderr, so a gap in the config never looks
+like a sort bug.
+
+`&` (overrun), `»` (postponed) and `«` (advanced) are **hidden** via `[roles].hide`. Hiding
+happens *after* dedup, so an earlier `[»]` never suppresses a later `[x]` — only a task
+whose *final* state is one of these disappears. `-S` overrides.
 
 ## Configuration
 
-Status display order, hidden statuses, project markers, and vault folder overrides live
-in a TOML file.
+Two files, both optional. Copy the examples from this repo:
 
-**Location** (first match wins):
+```sh
+mkdir -p ~/.config/obsidian-tasks && cp statuses.example.toml ~/.config/obsidian-tasks/statuses.toml
+mkdir -p ~/.config/tcat          && cp config.example.toml    ~/.config/tcat/config.toml
+```
 
-1. `--config PATH`
-2. `$TCAT_CONFIG`
-3. `$XDG_CONFIG_HOME/tcat/config.toml`
-4. **`$XDG_CONFIG_HOME/tdiff/config.toml`** — read-only fallback
-5. otherwise bootstrap `$XDG_CONFIG_HOME/tcat/config.toml` from the built-in defaults
+**`~/.config/obsidian-tasks/statuses.toml` — the shared table.** It describes *your vault's
+task notation*, not either tool, which is why it lives in a directory neither `tcat` nor
+`tdiff` owns. Both read it; each ignores the keys it doesn't understand (`tcat` reads
+`[order]`, `[theme.*]` and `[roles]`; `tdiff` reads `priority` and `ignore`), so the two
+cannot drift and neither has to be installed for the other to work.
 
-Step 4 is the point: with no `tcat` config present, both tools read one status table and
-cannot drift. Creating `~/.config/tcat/config.toml` is an explicit opt-out.
+**`~/.config/tcat/config.toml` — a `tcat`-only overlay.** Vault folder overrides, plus
+anything from the shared table you want `tcat` to see differently.
 
-Unlike `tdiff`, the config is **merged over** the built-in defaults rather than replacing
-them. A shared `tdiff` config has no `order` or `hide` keys, so a status missing `order`
-falls back to `tcat`'s built-in rank, not to `0`. `tdiff` ignores unknown keys, so adding
-`order`/`hide` to the shared file is safe for both.
+**Layers**, lowest precedence first. Each *merges* over the ones below it, so a partial
+file never erases what a lower layer set:
+
+1. `$XDG_CONFIG_HOME/obsidian-tasks/statuses.toml`
+2. `$XDG_CONFIG_HOME/tcat/config.toml`
+3. `$TCAT_CONFIG`
+4. `--config PATH`
+
+There is no built-in layer beneath these, and nothing is ever bootstrapped. With none of
+them present `tcat` still runs — unranked and uncoloured — and says so once on stderr.
+Lists replace wholesale rather than merging element-wise: naming a partial
+`[order].statuses` in an overlay means exactly that order.
 
 ```toml
-[statuses.x]
-name = "done"
-order = 9        # display rank; lower sorts first. Ties break alphabetically
+[order]
+# Rank is position. Statuses omitted here sort last, uncoloured.
+statuses = ["u", "!", "i", "*", ">", "=", "o", "p", " ", "/", "#", "~", "&", "»", "«", "-", "x"]
 
-[statuses."»"]
-name = "postponed"
-hide = true      # never shown; filtered after dedup
+[roles]
+project  = ["p", "i", "u"]   # opens a project group; dropped entirely by --flat
+hide     = ["&", "»", "«"]   # never shown; filtered after dedup
+full_row = ["x", "-"]        # colour the whole line, not just the [x] marker
 
-[statuses.u]
-name = "urgent project"
-order = 0
-project = true   # opens a project group; dropped entirely by --flat
+[theme.dark]
+"!" = "#a20ef1"
+"x" = "#b3b3b3"
+# statuses omitted here render in the terminal's default foreground
+
+[theme.light]
+"!" = "#7a0bb5"
+"x" = "#8a8a8a"
 
 [vault]
 daily_folder = ""    # optional folder prefix; empty = resolve by name anywhere
 weekly_folder = ""
 ```
 
-`tdiff`'s `priority` and `ignore` keys are read but unused: `tcat` dedups by page
-position, and `ignore` is a diff-side concept with no meaning in a viewer.
+Colours are 24-bit hex. Which palette is used: **`$TCAT_THEME=light|dark`**, else the
+`COLORFGBG` variable most terminals set, else dark. Terminals don't reliably report their
+background, so an env var settles it rather than a query that would need raw-tty mode.
 
 ## How the weekly note is read
 
@@ -290,31 +366,11 @@ day allocation only.
 
 ## Empty results
 
-An empty result is never an error, but `-v` distinguishes the reasons:
+An empty result is never an error. Whatever the cause — no note, no `### *Actio*` section,
+nothing allocated to that day, or a weekly note predating the day ladder — the output is
+one line, `nothing to show`, and the exit status is 0. `--no-summary` suppresses even that.
 
-```
-no note found for '2026-W09'
-2026-W09 has no ### *Actio* section
-2026-W09's Actio is empty
-2026-W09 predates the day ladder: its Actio holds 36 tasks as one flat week list, not split by day
-nothing allocated to sunday in 2026-W09's Actio
-nothing allocated to any day in 2026-W09's Actio
-no daily notes found for 2026-W09
-2026-W09's 3 daily notes hold no tasks
-```
-
-The pre-ladder and nothing-allocated lines are opposite signals and worth telling apart.
-Older weekly notes may use an earlier template with no `**day**` markers at all — for `-A`
-that is the difference between a week nobody planned and a week planned in a shape this
-tool can't split.
-
-`--missio` has three of its own:
-
-```
-no note found for '2026-W09'
-2026-W09 has no ### *Missio* section
-2026-W09's Missio is empty
-```
+An earlier build explained *which* of those it was, behind `-v`. Both are gone.
 
 ## Known gaps
 
@@ -340,7 +396,7 @@ has made the failure quieter, so this now matters more than it did:
 
 | | across the boundary |
 | --- | --- |
-| `tcat -A` | **fine** — the seven dates are correct regardless of label; only the header reads `2026-W53` |
+| `tcat -A` | **fine** — the seven dates are correct regardless of label; only the footer reads `2026-W53` |
 | `tcat -A -P`, `tcat --missio` | **broken** — they look for `2026-W53`, which doesn't exist, and report "no note found" |
 | `tcat w2027-W01 …` | **silently wrong** — resolves to Sun 2026-12-27, then relabels itself `2026-W53` and reads that. The vault's real `2027-W01` is unreachable by name |
 

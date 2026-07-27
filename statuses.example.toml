@@ -1,0 +1,97 @@
+# The vault's task-status vocabulary.
+#
+# Install to ~/.config/obsidian-tasks/statuses.toml — a directory neither `tcat`
+# nor `tdiff` owns. That is the point: this file describes *your vault's notation*,
+# not either tool, so both can read one table and neither has to be installed for
+# the other to work.
+#
+# tcat reads [order], [theme.*] and [roles]. tdiff reads `priority` and `ignore`.
+# Each tool ignores what it doesn't understand, so the two cannot drift.
+#
+# tcat has NO built-in ordering or colours. A status missing from [order].statuses
+# renders last and uncoloured, and tcat says so once on stderr.
+
+
+# ── Order ─────────────────────────────────────────────────────────────────────
+#
+# Rank is position in this list — first sorts first. Ties cannot be expressed, and
+# reordering is a matter of moving a string. Statuses not listed sort last as a
+# block, alphabetically within it.
+#
+#   u  urgent project        i  important project     p  project
+#   !  urgent                *  important             o  recurrent
+#   >  current               =  paused / switch       /  partial
+#   #  blocked / waiting     ~  snoozed               &  overrun
+#   »  postponed             «  advanced              -  cancelled
+#   x  done                (space) task
+#
+# The sequence below groups colours contiguously — purple, gold, blue, uncoloured,
+# grey — so the list reads as blocks rather than a gradient. `p` and (space) are
+# the deliberate uncoloured island between the blue and grey groups.
+
+[order]
+statuses = ["u", "!", "i", "*", ">", "=", "o", "p", " ", "/", "#", "~", "&", "»", "«", "-", "x"]
+
+
+# ── Roles ─────────────────────────────────────────────────────────────────────
+
+[roles]
+# Structural markers: each opens a project group in the default view, and all are
+# dropped entirely by --flat.
+project  = ["p", "i", "u"]
+
+# Never shown. Filtered *after* dedup, so an earlier [»] never suppresses a later
+# [x]. -S/--status overrides this.
+hide     = ["&", "»", "«"]
+
+# Statuses whose whole row takes the colour, not just the [x] marker. Reserve this
+# for settled work: it is what makes a grey *line* ("done with") read differently
+# from a grey *marker* ("deprioritised, still open").
+full_row = ["x", "-"]
+
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+#
+# 24-bit hex, one entry per status. A status with no entry renders in the
+# terminal's default foreground — which is the right answer for the most common
+# statuses, so the list is deliberately incomplete.
+#
+# Which palette is used: $TCAT_THEME=light|dark, else the COLORFGBG most terminals
+# set, else dark.
+
+[theme.dark]
+"u" = "#910dd9"    # urgent project  ┐ purple
+"!" = "#a20ef1"    # urgent          ┘
+"i" = "#e0b400"    # important project ┐ gold
+"*" = "#e0b400"    # important         ┘
+">" = "#0d77ff"    # current         ┐
+"=" = "#0d77ff"    # paused / switch │ blue
+"o" = "#0d77ff"    # recurrent       ┘
+# p and " " intentionally absent — default foreground
+"/" = "#b3b3b3"    # partial         ┐
+"#" = "#b3b3b3"    # blocked         │
+"~" = "#b3b3b3"    # snoozed         │ grey — open, but deprioritised
+"&" = "#b3b3b3"    # overrun         │
+"»" = "#b3b3b3"    # postponed       │
+"«" = "#b3b3b3"    # advanced        ┘
+"-" = "#b3b3b3"    # cancelled       ┐ grey, whole row (see roles.full_row)
+"x" = "#b3b3b3"    # done            ┘
+
+[theme.light]
+# Gold and grey are the two that genuinely wash out on a white background; the
+# rest are darkened for contrast rather than because they were unreadable.
+"u" = "#6f0aa8"
+"!" = "#7a0bb5"
+"i" = "#8a6d00"
+"*" = "#8a6d00"
+">" = "#0a5bc4"
+"=" = "#0a5bc4"
+"o" = "#0a5bc4"
+"/" = "#8a8a8a"
+"#" = "#8a8a8a"
+"~" = "#8a8a8a"
+"&" = "#8a8a8a"
+"»" = "#8a8a8a"
+"«" = "#8a8a8a"
+"-" = "#8a8a8a"
+"x" = "#8a8a8a"

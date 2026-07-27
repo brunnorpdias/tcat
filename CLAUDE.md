@@ -32,7 +32,8 @@ whole design. Re-verify before changing the reader; don't re-derive from scratch
 
 6. **Older weekly notes predate the day ladder.** Their `### *Actio*` is one flat week
    list with no `**day**` markers (two such notes in testing held 36 and 46 tasks). `-P`
-   correctly returns nothing for a specific day; `-v` says so distinctly.
+   correctly returns nothing for a specific day, and says only `nothing to show` — the
+   distinct explanation `-v` used to give was removed along with the flag.
 
 7. **`### *Missio*` is unfenced prose.** It sits under `## *Prospectus*`, immediately
    before `### *Actio*`, and holds paragraphs (sometimes a bullet list), not tasks.
@@ -88,14 +89,14 @@ tcat [date] [flags]                # no build step
 python3 tcat 2026-03-04 --no-color
 python3 tcat -P tuesday --no-color
 python3 tcat 2026-03-04 --flat --no-color
-python3 tcat -P 2026-01-07 -v --no-color   # pre-ladder week, distinct -v reason
+python3 tcat -P 2026-01-07 --no-color      # pre-ladder week, empty
 python3 tcat 2026-03-04 --json
 python3 tcat -A --no-color                 # the week actually done, merged
 python3 tcat -A -P --no-color              # the week as planned
 python3 tcat -A w30 --no-color             # a week by number
 python3 tcat -A -w -1 --flat --json        # last week
 python3 tcat --missio --no-color           # the week's mission, verbatim
-python3 tcat 2026-06-10 --missio -v        # a week with no Missio section
+python3 tcat 2026-06-10 --missio           # a week with no Missio section
 ```
 
 No test suite — testing is manual via CLI invocation, as in `tdiff`.
@@ -109,6 +110,9 @@ One executable file: `tcat`. Pipeline:
    retry and `stdin=DEVNULL` guards. Results are memoised; `prefetch()` warms several notes
    at once through a 4-worker pool (`TCAT_WORKERS`) and is called only by `-A`, so
    single-note modes cost exactly what they always did.
+
+   `survey_region()` used to sit here, existing only to tell empty results apart for `-v`.
+   Both are gone — see **Key behaviours**.
 
 2. **Parse** — `parse_note()` yields `(indent, status_char, name, seq)`. Fence-agnostic
    (finding 4). In weekly mode it filters to `region='actio'` and a ladder day; in daily
@@ -135,7 +139,9 @@ One executable file: `tcat`. Pipeline:
    the single most important difference from `tdiff` and is marked in the source.
 
 5. **Sort & render** — `(STATUS_ORDER rank, name.lower())` at every level. `--flat` drops
-   project parents and sorts alphabetically only.
+   project parents and sorts alphabetically only. `row()` colours the status marker only,
+   except for `FULL_ROW` statuses (`x`, `-`) which take the colour across the whole line;
+   `footer()` emits the single context line, always `contents · mode · file(s)`.
 
 ## Vendored core
 
@@ -158,17 +164,36 @@ document why.
 
 ## Config
 
-Resolution (first match wins): `--config` → `$TCAT_CONFIG` → `~/.config/tcat/config.toml`
-→ **`~/.config/tdiff/config.toml`** (read-only fallback; never bootstrapped, never warned
-about) → bootstrap `~/.config/tcat/config.toml`.
+**Layered, lowest precedence first** — every source *merges* over the ones below it,
+including `$TCAT_CONFIG` and `--config`:
 
-The shared fallback is the point: with no `tcat` config, both tools read one status table
-and cannot drift.
+1. `~/.config/obsidian-tasks/statuses.toml` — the shared table
+2. `~/.config/tcat/config.toml` — tcat-only overlay
+3. `$TCAT_CONFIG`
+4. `--config`
 
-Unlike `tdiff`, the file is **merged over** built-in defaults rather than replacing them —
-a shared `tdiff` config has no `order`/`hide` keys, and a missing rank must not collapse to
-`0`. Keys: `order` (display rank, lower first, ties allowed), `hide` (never shown),
-`project` (opens a group). `tdiff`'s `priority` and `ignore` are read but unused.
+**There is no built-in layer, and nothing is ever bootstrapped.** `BUILTIN_ORDER` was
+deleted deliberately: inventing a fallback rank table is exactly how the old build ended
+up sorting by ranks nobody had chosen (`~/.config/tcat/config.toml` didn't exist, so it
+silently fell back to `tdiff`'s config, which has no `order` key at all, so every rank came
+from code). With no config `tcat` runs unranked and uncoloured and says so via `notice()`.
+Don't reintroduce a default table in Python — the defaults belong in
+`statuses.example.toml`, which the user owns and edits.
+
+**The shared file sits outside both tool directories on purpose.** The status table
+describes the *vault's* notation, not either tool, so `obsidian-tasks/` is a directory
+neither owns. That is what lets `tcat` and `tdiff` share one table while neither depends on
+the other being installed. Each ignores the other's keys — `tcat` reads `[order]`,
+`[theme.*]`, `[roles]`; `tdiff` reads `priority`/`ignore` — so they cannot drift.
+
+**Order is a list, not integer ranks.** `[order].statuses` is an ordered list; rank is
+position. Ties are therefore inexpressible (the old table had three) and reordering is a
+move rather than a renumbering. Statuses absent from it get `UNRANKED`, sort last, render
+uncoloured, and are named once on stderr by `report_unlisted()`.
+
+Other keys: `[roles]` `project` / `hide` / `full_row`, `[theme.dark]` / `[theme.light]`
+(24-bit hex), `[vault]` folders. Theme choice: `$TCAT_THEME` → `COLORFGBG` → dark.
+Lists replace wholesale; only tables merge (`_merge()`).
 
 ## Key behaviours
 
@@ -177,12 +202,15 @@ a shared `tdiff` config has no `order`/`hide` keys, and a missing rank must not 
 | Weekday names resolve **backwards** | `tuesday` = most recent Tuesday at or before today. A future weekday has no tasks yet. |
 | Future date without `-P` | Hard error — the daily note won't exist. |
 | `&` `»` `«` hidden | Filtered **after** dedup, so an earlier `[»]` never suppresses a later `[x]`. `-S` overrides. |
-| Empty is never an error | Exit 0. `-v` distinguishes five reasons (missing note / no Actio / empty Actio / pre-ladder week / nothing that day). |
+| Empty is never an error | Exit 0, one dim `nothing to show`, whatever the cause. `-v` and the eleven per-reason strings were removed deliberately; don't reinstate them. |
 | Fixa, `future`, `promissum` | Parsed as ladder markers so they can't leak into a day, but **not exposed** — including under `-A`. v1 is Actio days only. |
 | `-A` dedup spans the week | A task on Monday restated on Friday collapses to one row with Friday's status. Falls out of `materialize()`'s last-occurrence rule — but only because the seven notes are read in date order and `seq` is **offset to keep climbing between notes**. `parse_note()` restarts `seq` at 0 per call; drop the offset and "last in page order" silently becomes "last in whichever note". |
 | `-A` drops day attribution | Deliberate. It answers *what happened this week*, not *when* — a by-day layout was considered and rejected. The date picks the week, the weekday is ignored, and `weekday` is `null` in JSON. |
 | `-A` drops `**future**` | Via `parse_note(skip_future=True)`, which **only** `-A` passes. Single-day output still shows future buckets, unchanged. See finding 8. |
 | `-A` never reads the weekly note | Dailies only. That is why `tcat` has no `-W/--no-weekly`: unlike `tdiff`, plan and actual never share an aggregate, so there is nothing to switch off. |
+| Colour is marker-only | Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
+| Footer is always three fields | `contents · mode · file(s)`, in every mode including `--missio` (whose `contents` is the literal `text`). Projects fold into `contents` rather than taking a field. `--no-summary` drops the whole line, date included. |
+| The file field names what was read | So `-P` shows the weekly note, not the invoked day; `-A` names the week plus `(n/7 dailies)` because it never opens the weekly note. |
 | `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-P`/`-f`/`-S`/`--routines`/`-A` are ignored. |
 | `--missio` JSON is minimal | Exactly `{"week", "missio"}` — deliberately *not* the task envelope. `missio` is `null` for missing note, missing heading, or empty body. |
 
