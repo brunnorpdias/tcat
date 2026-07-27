@@ -87,6 +87,12 @@ last Tuesday and `monday` means today.
 Asking for a future date without `-P` is an error: the daily note won't exist. Use `-P`
 to read the plan's allocation for a day that hasn't happened.
 
+Weeks run Sunday to Saturday, and **a week is named for the year it ends in** — week 1 is
+the week containing Jan 1, so Sun 2026-12-27 → Sat 2027-01-02 is `w2027-W01`, matching the
+vault's filenames. Naming a week the calendar can't produce (`w2026-W53`, which is really
+2027-W01) is rejected with the correct label, rather than silently reading a note that
+doesn't exist.
+
 `w30` names week 30 of the current year; `w2026-W30` is explicit. Both come from `tdiff`,
 verbatim, so the two tools take the same week arguments. A week isn't a day, so a bare
 `tcat w30` is an error — say what you want for it (`-A`, `-A -P` or `--missio`). The
@@ -102,6 +108,7 @@ relative form is `-w N`: `-w -1` is last week, `-w 0` the date's own week.
 | `--missio` | print the weekly note's `### *Missio*` section verbatim instead of any tasks |
 | `-f`, `--flat` | drop project grouping, promote children to top level, sort alphabetically |
 | `-S SET` | show only these status chars; prefix `^` to invert. Overrides hidden statuses |
+| `-I`, `--ignore` | hide settled tasks — the statuses in `[roles].settled` — leaving only what is still open |
 | `--routines` | include `#routine` tasks (excluded by default) |
 | `--json` | machine-readable output |
 | `--no-color`, `--no-summary`, `--config PATH` | as in `tdiff` |
@@ -170,7 +177,9 @@ sorted alphabetically. This is the task set `tdiff` sees for the same date.
 ### Colour
 
 Only the status marker is coloured; task names stay in the terminal's default foreground.
-A wall of tinted prose is harder to read than a column of tinted markers.
+A wall of tinted prose is harder to read than a column of tinted markers. The brackets take
+the colour along with the symbol — `[x]` reads as one glyph, and tinting only the char
+inside it leaves the marker looking half-lit.
 
 The exception is done and cancelled, which take their colour across the **whole row**. So
 grey carries two distinct signals: a grey *marker* means deprioritised but still open, a
@@ -281,6 +290,20 @@ like a sort bug.
 happens *after* dedup, so an earlier `[»]` never suppresses a later `[x]` — only a task
 whose *final* state is one of these disappears. `-S` overrides.
 
+`-I` hides `[roles].settled` on top of that — `x`, `-`, `&`, `»`, `«` by default — which
+leaves only work that is still open. The three filters compose, with one rule: **a `-S` that
+names a status outright wins.** So `-I -S x` shows done tasks rather than nothing; asking for
+something by name is the strongest statement that you want to see it. A *negated* `-S` names
+only what to drop, so `-I` still applies to everything it didn't name (`-I -S '^ '` = open,
+non-blank, non-settled).
+
+`-I` has no built-in status set. With no `[roles].settled` in your config it hides nothing
+and says so once on stderr — the same contract as `[order].statuses`.
+
+`[roles].settled` is shared with `tdiff`, whose `-I` reads the same key. The flags mean the
+same thing in both tools, with one difference that follows from what each tool does: `tdiff`
+applies it to the settled (A) side only, so added and changed rows are never hidden by it.
+
 ## Configuration
 
 Two files, both optional. Copy the examples from this repo:
@@ -292,9 +315,11 @@ mkdir -p ~/.config/tcat          && cp config.example.toml    ~/.config/tcat/con
 
 **`~/.config/obsidian-tasks/statuses.toml` — the shared table.** It describes *your vault's
 task notation*, not either tool, which is why it lives in a directory neither `tcat` nor
-`tdiff` owns. Both read it; each ignores the keys it doesn't understand (`tcat` reads
-`[order]`, `[theme.*]` and `[roles]`; `tdiff` reads `priority` and `ignore`), so the two
-cannot drift and neither has to be installed for the other to work.
+`tdiff` owns. Both read it and each ignores what it has no use for — `tcat` takes `[order]`,
+`[theme.*]` and `[roles].full_row`, `tdiff` takes `[dedup]`, and `[roles]` `project` / `hide`
+/ `settled` are read by both. So the two cannot drift, and neither has to be installed for
+the other to work. Both repos ship a byte-identical copy of this file; installing either
+tool gets you the whole table.
 
 **`~/.config/tcat/config.toml` — a `tcat`-only overlay.** Vault folder overrides, plus
 anything from the shared table you want `tcat` to see differently.
@@ -320,6 +345,7 @@ statuses = ["u", "!", "i", "*", ">", "=", "o", "p", " ", "/", "#", "~", "&", "»
 [roles]
 project  = ["p", "i", "u"]   # opens a project group; dropped entirely by --flat
 hide     = ["&", "»", "«"]   # never shown; filtered after dedup
+settled  = ["x", "-", "&", "»", "«"]   # hidden by -I; shared with tdiff
 full_row = ["x", "-"]        # colour the whole line, not just the [x] marker
 
 [theme.dark]
@@ -374,7 +400,7 @@ An earlier build explained *which* of those it was, behind `-v`. Both are gone.
 
 ## Known gaps
 
-Four things are deliberately unfinished. None affect day-to-day use today.
+Three things are deliberately unfinished. None affect day-to-day use today.
 
 **0. `-A` over a week before `2026-W20` over-counts.** Weekly notes only start at W20;
 before that the whole weekly structure — including the coming week's day-by-day plan —
@@ -384,33 +410,12 @@ in alongside six days of actual work. Dropping the `**future**` bucket removes t
 part of it; the rest stands. Fixing it properly would mean re-introducing fence tracking,
 which is the one thing that section says not to do.
 
-**1. `week_span()` disagrees with the templates across a New Year — NOT YET FIXED.** The
-weekly templates name files with moment's `gggg[-W]ww`; `week_span()` computes the label
-itself. Both start weeks on Sunday and put week 1 on the week containing Jan 1, but the
-week-*year* diverges when a week straddles the boundary. The week of Sun 2026-12-27 runs
-to Sat 2027-01-02, so moment names it `2027-W01` while `week_span()` yields `2026-W53` — a
-file that won't exist.
+**1. One behaviour is unverified because the vault has no data for it.** The vault used for
+testing spans a single quarter, which contains no `### *Mensis*` section — so the claim that
+the ladder whitelist keeps Mensis's prospect checkboxes out of a day is reasoned, not tested.
+Re-run that check once such a note exists.
 
-Only the straddling week is affected; the rest of each year agrees. But week *selection*
-has made the failure quieter, so this now matters more than it did:
-
-| | across the boundary |
-| --- | --- |
-| `tcat -A` | **fine** — the seven dates are correct regardless of label; only the footer reads `2026-W53` |
-| `tcat -A -P`, `tcat --missio` | **broken** — they look for `2026-W53`, which doesn't exist, and report "no note found" |
-| `tcat w2027-W01 …` | **silently wrong** — resolves to Sun 2026-12-27, then relabels itself `2026-W53` and reads that. The vault's real `2027-W01` is unreachable by name |
-
-The last row is the bad one: it fails without saying so. This is inherited from `tdiff`
-and affects both tools, so it needs a **joint fix** — `resolve_week_label` and
-`_week_label_to_sunday` are vendored from `tdiff` too, and correcting it in `tcat` alone
-would make the two disagree about which note to read. **Due before December 2026.**
-
-**2. Two behaviours are unverified because the vault has no data for them.** The vault used for testing spans a
-single quarter, which contains no New Year–straddling week and no `### *Mensis*` section. So gap 1 has never been reproduced against a real file, and the
-claim that the ladder whitelist keeps Mensis's prospect checkboxes out of a day is
-reasoned, not tested. Re-run both checks once such notes exist.
-
-**3. No test suite.** Testing is manual via CLI invocation, matching `tdiff`. The checks
+**2. No test suite.** Testing is manual via CLI invocation, matching `tdiff`. The checks
 worth automating first are the ones that actually caught bugs during the build: parse
 counts against `obsidian tasks` for every weekly note, and `--flat` against `tdiff`'s task
 set for the same date.
@@ -429,7 +434,7 @@ tools/check-core-sync.sh [path-to-tdiff-repo]
 ```
 
 It diffs each vendored function and constant against `tdiff` at the pinned commit
-(`1e7f11c`) and exits non-zero on any difference. `materialize` is deliberately excluded:
+(`e2976c0`) and exits non-zero on any difference. `materialize` is deliberately excluded:
 `tcat` reduces a cluster by page position, `tdiff` by `priority`.
 
 ## License

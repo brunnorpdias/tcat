@@ -9,9 +9,9 @@ from datetime import date, timedelta
 from pathlib import Path
 
 # ── Vendored task core ────────────────────────────────────────────────────────
-# Synced from brunnorpdias/tdiff@1e7f11c ("make vault lookups folder-agnostic,
-# move status config to toml"). Keep this block byte-identical to tdiff's where
-# marked; tools/check-core-sync.sh verifies it. Divergences are called out inline.
+# Synced from brunnorpdias/tdiff@e2976c0 ("label a week by the year it ends in").
+# Keep this block byte-identical to tdiff's where marked; tools/check-core-sync.sh
+# verifies it. Divergences are called out inline.
 
 _SEP_RE = re.compile(r' [-–—] ')  # hyphen, en-dash, em-dash
 
@@ -49,21 +49,11 @@ def _tokens(s):
             out.append(t)
     return out
 
-def is_same_task(a, b):
-    """Predicate: same logical task. Token-set equality, or strict subset sharing first word."""
-    ta, tb = _tokens(a), _tokens(b)
-    sa, sb = set(ta), set(tb)
-    if not sa or not sb:
-        return a == b
-    if sa == sb:
-        return True
-    if (sa < sb or sb < sa) and ta and tb and ta[0] == tb[0]:
-        return True
-    return False
-
 def cluster_records(records):
-    """Cluster records by is_same_task using union-find. Returns list of clusters
-    (each a list of records) in first-seen order of their root base."""
+    """Cluster records that name the same logical task, using union-find. Two bases
+    are the same task when their token sets are equal, or when one is a strict subset
+    of the other and both start with the same token. Returns a list of clusters (each
+    a list of records) in first-seen order of their root base."""
     bases_in_order, seen = [], set()
     for base, _, _ in records:
         if base not in seen:
@@ -81,10 +71,26 @@ def cluster_records(records):
         if ra != rb:
             parent[ra] = rb
 
-    for i, a in enumerate(bases_in_order):
-        for b in bases_in_order[i + 1:]:
-            if is_same_task(a, b):
-                union(a, b)
+    # Bucketing on the two merge keys gives the same clusters as an all-pairs scan
+    # without tokenizing (or comparing) every pair. Tokenless bases could only merge
+    # by exact string equality, which distinct bases never satisfy — so skip them.
+    by_tokens, by_first = {}, {}
+    for b in bases_in_order:
+        toks = _tokens(b)
+        if not toks:
+            continue
+        key = frozenset(toks)
+        by_tokens.setdefault(key, []).append(b)
+        by_first.setdefault(toks[0], []).append((b, key))
+
+    for group in by_tokens.values():
+        for b in group[1:]:
+            union(group[0], b)
+    for group in by_first.values():
+        for i, (a, sa) in enumerate(group):
+            for b, sb in group[i + 1:]:
+                if sa < sb or sb < sa:
+                    union(a, b)
 
     by_root = {}
     for rec in records:
@@ -106,10 +112,16 @@ def week_span(d):
     days_back = (d.weekday() + 1) % 7   # Mon=0..Sun=6 -> Sun=0
     sun = d - timedelta(days=days_back)
     sat = sun + timedelta(days=6)
-    jan1 = date(sun.year, 1, 1)
+    # The label's year is the *Saturday's*, not the Sunday's. Week 1 is the week
+    # containing Jan 1, so a week straddling New Year belongs to the year it ends
+    # in — which is what the vault's moment `gggg[-W]ww` filenames say. Anchoring
+    # on the Sunday called Sun 2026-12-27 → Sat 2027-01-02 `2026-W53`, a file that
+    # does not exist, and made the vault's real `2027-W01` unreachable by name.
+    # Only the straddling week per year is affected; all others are unchanged.
+    jan1 = date(sat.year, 1, 1)
     days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
     week_num = ((sun - jan1).days + days_back) // 7 + 1
-    return sun, sat, f"{sun.year}-W{week_num:02d}"
+    return sun, sat, f"{sat.year}-W{week_num:02d}"
 
 _WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
 _WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
@@ -157,6 +169,7 @@ STATUS_ORDER     = {}     # char -> rank, derived from [order].statuses position
 THEMES           = {}     # theme name -> {char: '#rrggbb'}
 FULL_ROW         = set()  # statuses whose whole row takes the colour, not just [x]
 HIDDEN_STATUSES  = set()
+SETTLED_STATUSES = set()  # terminal states, hidden only when -I asks
 PROJECT_STATUSES = set()
 DAILY_FOLDER  = ''
 WEEKLY_FOLDER = ''
@@ -219,7 +232,7 @@ def load_config(override, error):
     error.
     """
     global STATUS_ORDER, THEMES, FULL_ROW, HIDDEN_STATUSES, PROJECT_STATUSES
-    global DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
+    global SETTLED_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
 
     merged = {}
     for path in config_paths(override):
@@ -245,6 +258,7 @@ def load_config(override, error):
     roles = merged.get('roles', {})
     PROJECT_STATUSES = set(roles.get('project', []))
     HIDDEN_STATUSES  = set(roles.get('hide', []))
+    SETTLED_STATUSES = set(roles.get('settled', []))
     FULL_ROW         = set(roles.get('full_row', []))
 
     vault = merged.get('vault', {})
@@ -508,6 +522,11 @@ parser.add_argument('-S', '--status',   type=str, default=None,
                          "(concatenated chars, e.g. 'x-#'); prefix '^' to invert "
                          "(e.g. '^x'). Overrides hidden statuses. Bare '-S -' looks "
                          "like a flag to argparse; use -S=- or quote in a set ('x-')")
+parser.add_argument('-I', '--ignore',   action='store_true',
+                    help='hide settled tasks — the statuses named by [roles] settled '
+                         '(done, cancelled, overrun, postponed, advanced) — leaving only '
+                         'what is still open. Composes with -S, which wins for any '
+                         'status it names outright')
 parser.add_argument('--routines',       action='store_true', help='include #routine tasks')
 parser.add_argument('--json',           action='store_true', help='machine-readable output')
 parser.add_argument('--no-color',       action='store_true', help='disable colored output')
@@ -602,6 +621,14 @@ else:
 
 if week_arg:
     target_d = _week_label_to_sunday(week_arg)
+    # Not every YYYY-W## string is a week. Labels are named for the year a week
+    # ends in, so `2026-W53` maps onto a Sunday whose week is really 2027-W01 —
+    # a phantom that would otherwise be read as if it were real. Round-tripping
+    # the label through week_span() is what catches it.
+    real_label = week_span(target_d)[2]
+    if real_label != week_arg:
+        parser.error(f"{raw_date} is not a week in this calendar "
+                     f"(that Sunday belongs to {real_label}); did you mean w{real_label}?")
     target = target_d.isoformat()
 else:
     target = resolve_date(raw_date)
@@ -627,11 +654,33 @@ if args.status is not None:
         parser.error("--status expects at least one status char (e.g. 'x-#' or '^x')")
     status_filter = (chars, negate)
 
+# Same contract as [order].statuses: no built-in table, so an unconfigured -I
+# filters nothing rather than inventing a set of statuses to call settled.
+if args.ignore and not SETTLED_STATUSES:
+    notice('-I: no [roles] settled in config — nothing to hide')
+
 def status_match(ch):
-    if status_filter is None:
-        return ch not in HIDDEN_STATUSES
-    chars, negate = status_filter
-    return (ch not in chars) if negate else (ch in chars)
+    """Is this status visible?
+
+    Three filters can suppress a status: [roles] hide (config, always on), -I
+    (settled work), and -S (an explicit set). They compose, except that -S wins
+    outright for any status it names — asking for something by name is the
+    strongest possible statement that you want to see it.
+    """
+    if status_filter is not None:
+        chars, negate = status_filter
+        # A positive -S names exactly what it wants, so it overrides both `hide`
+        # and -I: `-I -S x` is a request to see done tasks, not a contradiction.
+        if not negate:
+            return ch in chars
+        if ch in chars:
+            return False
+        # A negated -S only names what to drop. It still overrides `hide` for
+        # everything it didn't name, but -I is an explicit flag on the same
+        # command line, so it keeps applying to the remainder.
+        return not (args.ignore and ch in SETTLED_STATUSES)
+    return (ch not in HIDDEN_STATUSES
+            and not (args.ignore and ch in SETTLED_STATUSES))
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -685,10 +734,14 @@ if use_color:
 def row(status, name, indent):
     """One task line.
 
-    Only the status symbol is coloured — a wall of tinted prose is harder to read
-    than a column of tinted markers. The exception is `full_row` (done, cancelled):
-    those take the colour across the whole line, so grey carries two distinct
-    signals — a grey marker means deprioritised but open, a grey line means settled.
+    Only the status marker is coloured — a wall of tinted prose is harder to read
+    than a column of tinted markers. The brackets are coloured along with the
+    symbol: `[x]` is one glyph to the eye, and tinting only the char inside it
+    leaves the marker looking half-lit rather than deliberate.
+
+    The exception is `full_row` (done, cancelled): those take the colour across
+    the whole line, so grey carries two distinct signals — a grey marker means
+    deprioritised but open, a grey line means settled.
     """
     c = STATUS_SGR.get(status, '')
     if not c:

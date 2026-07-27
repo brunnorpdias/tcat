@@ -36,3 +36,4 @@ weekly_folder = ""
 #
 # [roles]
 # hide = []          # show overrun/postponed/advanced by default
+# settled = ["x"]    # make -I hide only done tasks, not cancelled ones too

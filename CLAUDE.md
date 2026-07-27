@@ -146,10 +146,16 @@ One executable file: `tcat`. Pipeline:
 ## Vendored core
 
 The block between `# ── Vendored task core` and `# ── End vendored core` is copied
-verbatim from `tdiff` at pinned commit **`1e7f11c`**: `strip_section_suffix`,
-`WIKILINK_RE`/`_strip_wiki_path`/`normalize_wikilinks`, `_PUNCT`/`_tokens`/`is_same_task`,
+verbatim from `tdiff` at pinned commit **`e2976c0`**: `strip_section_suffix`,
+`WIKILINK_RE`/`_strip_wiki_path`/`normalize_wikilinks`, `_PUNCT`/`_tokens`,
 `cluster_records`, `week_span`, `_SEP_RE`, and the week-selection set
 `resolve_week_label`/`_week_label_to_sunday`/`_WEEK_SHORT_RE`/`_WEEK_FULL_RE`.
+
+**`is_same_task` is gone** — upstream folded it into `cluster_records`, which now buckets
+on the two merge keys instead of scanning all pairs. Same clusters, ~3× faster on `tdiff`'s
+inputs and immaterial on `tcat`'s. It came in with the `e2976c0` pin bump rather than
+being chosen: the whole block moves together or the sync check goes red. Verified inert
+against eleven `--json` captures across five weeks before landing.
 
 Vendoring beats a shared module: two files on `$PATH` with no install step is the
 deployment model. Keep it honest with:
@@ -183,15 +189,34 @@ Don't reintroduce a default table in Python — the defaults belong in
 **The shared file sits outside both tool directories on purpose.** The status table
 describes the *vault's* notation, not either tool, so `obsidian-tasks/` is a directory
 neither owns. That is what lets `tcat` and `tdiff` share one table while neither depends on
-the other being installed. Each ignores the other's keys — `tcat` reads `[order]`,
-`[theme.*]`, `[roles]`; `tdiff` reads `priority`/`ignore` — so they cannot drift.
+the other being installed.
+
+**The sharing is live as of July 2026** — briefly it wasn't, and the file's header claimed
+otherwise, which is worth knowing if you meet an older checkout. `tdiff` now layers the same
+`obsidian-tasks/statuses.toml` beneath its own config and reads `[roles]` from it. The split:
+
+| key | read by |
+|---|---|
+| `[order]` display rank, `[theme.*]` colours, `[roles].full_row` | `tcat` |
+| `[dedup].priority` tiers | `tdiff` |
+| `[roles]` `project` / `hide` / `settled` | **both** |
+
+`[order]` and `[dedup]` are deliberately *not* one key. They run opposite ways: `[order]`
+sorts `x` last (finished work belongs at the bottom), `[dedup]` ranks `x` first ("done" is
+the truest thing you can say about a task also written `[/]` on Tuesday). A flat list also
+can't express ties, and `[dedup]` has three.
+
+**`statuses.example.toml` is byte-identical in both repos, on purpose** — installing either
+tool gets the whole table. Keep it that way: `diff` it against `../tdiff/statuses.example.toml`
+before committing a change to it. It is the one file with no sync check, because it isn't
+code.
 
 **Order is a list, not integer ranks.** `[order].statuses` is an ordered list; rank is
 position. Ties are therefore inexpressible (the old table had three) and reordering is a
 move rather than a renumbering. Statuses absent from it get `UNRANKED`, sort last, render
 uncoloured, and are named once on stderr by `report_unlisted()`.
 
-Other keys: `[roles]` `project` / `hide` / `full_row`, `[theme.dark]` / `[theme.light]`
+Other keys: `[roles]` `project` / `hide` / `settled` / `full_row`, `[theme.dark]` / `[theme.light]`
 (24-bit hex), `[vault]` folders. Theme choice: `$TCAT_THEME` → `COLORFGBG` → dark.
 Lists replace wholesale; only tables merge (`_merge()`).
 
@@ -202,13 +227,15 @@ Lists replace wholesale; only tables merge (`_merge()`).
 | Weekday names resolve **backwards** | `tuesday` = most recent Tuesday at or before today. A future weekday has no tasks yet. |
 | Future date without `-P` | Hard error — the daily note won't exist. |
 | `&` `»` `«` hidden | Filtered **after** dedup, so an earlier `[»]` never suppresses a later `[x]`. `-S` overrides. |
+| `-I` hides `[roles].settled` | Boolean, like `tdiff`'s — *not* a char list; `-S` already covers that axis. Three filters compose (`hide`, `-I`, `-S`) under one rule: **a positive `-S` wins for the statuses it names**, so `-I -S x` shows done tasks rather than nothing. A negated `-S` names only what to drop, so `-I` still applies to the rest. No built-in set: unconfigured `-I` hides nothing and says so, like `[order].statuses`. |
+| `settled` is not `full_row` | They hold the same two chars by default and are still separate keys: `full_row` says how a row is *painted*, `settled` whether it is *there*. Welding them would make a colour edit silently change which tasks you see. |
 | Empty is never an error | Exit 0, one dim `nothing to show`, whatever the cause. `-v` and the eleven per-reason strings were removed deliberately; don't reinstate them. |
 | Fixa, `future`, `promissum` | Parsed as ladder markers so they can't leak into a day, but **not exposed** — including under `-A`. v1 is Actio days only. |
 | `-A` dedup spans the week | A task on Monday restated on Friday collapses to one row with Friday's status. Falls out of `materialize()`'s last-occurrence rule — but only because the seven notes are read in date order and `seq` is **offset to keep climbing between notes**. `parse_note()` restarts `seq` at 0 per call; drop the offset and "last in page order" silently becomes "last in whichever note". |
 | `-A` drops day attribution | Deliberate. It answers *what happened this week*, not *when* — a by-day layout was considered and rejected. The date picks the week, the weekday is ignored, and `weekday` is `null` in JSON. |
 | `-A` drops `**future**` | Via `parse_note(skip_future=True)`, which **only** `-A` passes. Single-day output still shows future buckets, unchanged. See finding 8. |
 | `-A` never reads the weekly note | Dailies only. That is why `tcat` has no `-W/--no-weekly`: unlike `tdiff`, plan and actual never share an aggregate, so there is nothing to switch off. |
-| Colour is marker-only | Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
+| Colour is marker-only | The whole `[x]` marker, brackets included — tinting only the inner char was tried in July 2026 and reverted; it reads as half-lit. Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
 | Footer is always three fields | `contents · mode · file(s)`, in every mode including `--missio` (whose `contents` is the literal `text`). Projects fold into `contents` rather than taking a field. `--no-summary` drops the whole line, date included. |
 | The file field names what was read | So `-P` shows the weekly note, not the invoked day; `-A` names the week plus `(n/7 dailies)` because it never opens the weekly note. |
 | `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-P`/`-f`/`-S`/`--routines`/`-A` are ignored. |
@@ -238,27 +265,32 @@ One divergence: `tdiff -w 0` excludes the anchor from its own week because it is
 
 See the **Known gaps** section of `README.md`.
 
-### Outstanding: weeks across a year boundary — STILL BROKEN, fix before December 2026
+### Weeks across a year boundary — FIXED July 2026, joint with `tdiff`
 
-`week_span()` disagrees with the templates' moment `gggg[-W]ww` for the one week that
-straddles a New Year: Sun 2026-12-27 → Sat 2027-01-02 is `2027-W01` in the vault and
-`2026-W53` here. Every other week of the year agrees.
+**A week is labelled by the year it *ends* in.** Week 1 is the week containing Jan 1, so
+Sun 2026-12-27 → Sat 2027-01-02 is `2027-W01`, matching the templates' moment `gggg[-W]ww`.
+`week_span()` anchors both its label and its Jan-1 reference on the **Saturday**; anchoring
+on the Sunday (as it did until this fix) produced `2026-W53` — a file that never exists —
+and made the vault's real `2027-W01` unaddressable by name.
 
-Week selection made this worse, not better, and it is the reason to prioritise the fix:
+Only the straddling week per year ever differed, which is why it stayed invisible: verified
+over 2020–2035, exactly 13 weeks change label, all of the form `YYYY-W53` → `YYYY+1-W01`
+(the old rule even invented a `2028-W54`). `_week_label_to_sunday()` was always correct and
+was **not** changed; label → Sunday → label round-trips under both rules, which is precisely
+why the bug was silent.
 
-- `-A` survives — the seven dates are right whatever the label says; only the header lies.
-- `-A -P` and `--missio` look for a note that doesn't exist and say "no note found".
-- **`w2027-W01` is silently wrong.** `_week_label_to_sunday('2027-W01')` gives Sun
-  2026-12-27, which `week_span()` then relabels `2026-W53`. The user names a real week and
-  gets a phantom, with no error. The vault's actual `2027-W01` cannot be addressed by name.
+The fix landed in `tdiff@e2976c0` first, then here with the pin bump — it must stay joint,
+since all three week functions are vendored. Two consequences worth keeping:
 
-The fix is **joint with `tdiff`** and must stay joint: `week_span`, `resolve_week_label`
-and `_week_label_to_sunday` are all vendored, so patching `tcat` alone would make the two
-tools disagree about which note to read — worse than the current shared wrongness. Do not
-"fix" it here in isolation, and do not let `tools/check-core-sync.sh` be the thing that
-discovers it.
+- **The phantom guard is `tcat`-only** and lives at the week-selection call site, not in the
+  vendored block. `w2026-W53` still resolves to a real Sunday, so it is caught by
+  round-tripping the label through `week_span()` and rejected with a suggestion. Without it
+  a user naming a plausible-but-nonexistent week gets silently wrong output.
+- `resolve_week_label('w01')` still stamps `date.today().year`, so a bare `w1` typed in late
+  December names *this* year's week 1, not the one about to start. Pre-existing, unrelated
+  to this fix, and arguably correct — noted so it isn't mistaken for a regression.
 
-Also outstanding: the Mensis exclusion is unverified (the vault holds no such note), the
+Still outstanding: the Mensis exclusion is unverified (the vault holds no such note), the
 pre-`2026-W20` Sunday contamination under `-A` (finding 8), and there is no test suite.
 
 ## Style

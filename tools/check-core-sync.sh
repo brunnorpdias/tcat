@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-PIN='1e7f11c'
+PIN='e2976c0'
 TDIFF_REPO="${1:-$HOME/Projects/tdiff}"
 TCAT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tcat"
 
@@ -29,7 +29,6 @@ FUNCS=(
   _strip_wiki_path
   normalize_wikilinks
   _tokens
-  is_same_task
   cluster_records
   week_span
   resolve_week_label
