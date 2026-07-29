@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 # ── Vendored task core ────────────────────────────────────────────────────────
-# Synced from brunnorpdias/tdiff@e2976c0 ("label a week by the year it ends in").
+# Synced from brunnorpdias/tdiff@123b5b1 ("share the status table with tcat, add -E").
 # Keep this block byte-identical to tdiff's where marked; tools/check-core-sync.sh
 # verifies it. Divergences are called out inline.
 

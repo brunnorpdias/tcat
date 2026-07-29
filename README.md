@@ -442,7 +442,7 @@ tools/check-core-sync.sh [path-to-tdiff-repo]
 ```
 
 It diffs each vendored function and constant against `tdiff` at the pinned commit
-(`e2976c0`) and exits non-zero on any difference. `materialize` is deliberately excluded:
+(`123b5b1`) and exits non-zero on any difference. `materialize` is deliberately excluded:
 `tcat` reduces a cluster by page position, `tdiff` by `priority`.
 
 ## License
