@@ -448,11 +448,15 @@ def extract_section(lines, name):
 def build_groups(records):
     """Fold flat (indent, status, name, seq) records into an ordered structure.
 
-    Returns a list of (status, name, children) where children is a list of
+    Returns a list of (status, name, children, seq) where children is a list of
     (status, name, seq); a bare task has children == None. Project groups merge
     across the note (blocks are hidden, so five identical headers would be noise);
     matching is case-insensitive because one note may write both [[Project Alpha]]
     and [[project alpha]].
+
+    A bare task keeps its seq because it still has to be deduped, and dedup picks
+    the winner by page position. A group header's seq is None: a header is never
+    clustered, and a merged group has several of them anyway.
     """
     tops, index, current = [], {}, None
     for indent, status, name, seq in records:
@@ -461,7 +465,7 @@ def build_groups(records):
             if key in index:
                 current = index[key]
             else:
-                current = [status, name, []]
+                current = [status, name, [], None]
                 index[key] = current
                 tops.append(current)
             continue
@@ -469,7 +473,7 @@ def build_groups(records):
             current[2].append((status, name, seq))
         else:
             current = None
-            tops.append([status, name, None])
+            tops.append([status, name, None, seq])
     return tops
 
 def dedup(items):
@@ -879,16 +883,27 @@ if args.flat:
             rows.append((status, name, None))
     rows.sort(key=lambda r: r[1].lower())   # --flat: alphabetical only
 else:
-    for status, name, children in build_groups(records):
+    # Dedup is scoped, and the scopes never merge into one another: every project's
+    # children collapse among themselves, and the bare tasks collapse among
+    # themselves. So a task written under two projects keeps a row under each — the
+    # header is real context — and a bare occurrence never swallows a project's copy.
+    # (--flat has no scopes and therefore collapses across all of them; that is why
+    # its leaf count can be lower than this branch's, which is not a discrepancy.)
+    # Bare tasks are collected rather than emitted inline because dedup needs to see
+    # the whole scope at once.
+    bare = []
+    for status, name, children, seq in build_groups(records):
         if children is None:
-            if status_match(status):
-                rows.append((status, name, None))
+            bare.append((status, name, seq))
             continue
         kids = [(s, n) for s, n in dedup(children) if status_match(s)]
         kids.sort(key=lambda k: sort_key(k[0], k[1]))
         # A project whose every child was filtered out is not worth a header.
         if kids:
             rows.append((status, name, kids))
+    for status, name in dedup(bare):
+        if status_match(status):
+            rows.append((status, name, None))
     rows.sort(key=lambda r: sort_key(r[0], r[1]))
 
 # ── Output ────────────────────────────────────────────────────────────────────

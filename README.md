@@ -168,11 +168,19 @@ appearing under five different blocks becomes one group holding every child.
 block 7 produces one row carrying its *last* status — the most recent statement of where
 it stands. (`tdiff` instead picks by `priority`, because it is comparing across days.)
 
+Collapsing is *scoped*: each project's children collapse among themselves, and the
+top-level tasks collapse among themselves, but never into one another. A task listed under
+two projects therefore keeps a row under each — the project header is context worth
+seeing — and a top-level occurrence never swallows a project's copy.
+
 **Links are cleaned.** `[[note|alias]]` → `alias`, `[[folder/note]]` → `note`,
 `[text](url)` → `text`.
 
 `--flat` undoes the first two levels of that: no project headers, children promoted,
-sorted alphabetically. This is the task set `tdiff` sees for the same date.
+sorted alphabetically. This is the task set `tdiff` sees for the same date. Having no
+projects, it also has no scopes, so it collapses across all of them — which is why `--flat`
+can show *fewer* rows than the grouped view of the same day. That is the two views
+answering different questions, not a discrepancy.
 
 ### Colour
 
