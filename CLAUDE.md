@@ -100,6 +100,8 @@ tcat [date] [flags]                # no build step
 python3 tcat 2026-03-04 --no-color
 python3 tcat -P tuesday --no-color
 python3 tcat 2026-03-04 --flat --no-color
+python3 tcat 2026-03-04 --order page --no-color
+python3 tcat -A w30 --order page --flat --no-color   # the week, chronologically
 python3 tcat -P 2026-01-07 --no-color      # pre-ladder week, empty
 python3 tcat 2026-03-04 --json
 python3 tcat -A --no-color                 # the week actually done, merged
@@ -149,8 +151,12 @@ One executable file: `tcat`. Pipeline:
    by `STATUS_PRIORITY`. Within one note the last statement is the current one. This is
    the single most important difference from `tdiff` and is marked in the source.
 
-5. **Sort & render** — `(STATUS_ORDER rank, name.lower())` at every level. `--flat` drops
-   project parents and sorts alphabetically only. `row()` colours the status marker only,
+5. **Sort & render** — `order_rows()` at every level, per `--order`; the default is
+   `(STATUS_ORDER rank, name.lower())`. `--flat` drops project parents and nothing else —
+   **structure and order are separate flags**, and welding them is what went wrong before
+   (`--flat` carried its own alphabetical-only sort and had quietly drifted from the
+   grouped view). Every sort in the output path goes through `order_rows()` so they can't
+   drift again. `row()` colours the status marker only,
    except for `FULL_ROW` statuses (`x`, `-`) which take the colour across the whole line;
    `footer()` emits the single context line, always `contents · mode · file(s)`.
 
@@ -256,13 +262,15 @@ Lists replace wholesale; only tables merge (`_merge()`).
 | Fixa, `future`, `promissum` | Parsed as ladder markers so they can't leak into a day, but **not exposed** — including under `-A`. v1 is Actio days only. |
 | Dedup is **scoped**, not global | Each project's children collapse among themselves; bare top-level tasks collapse among themselves as one further scope. The scopes never merge, so a task under two projects keeps a row under each, and a bare occurrence never swallows a project's copy. `--flat` has no scopes and collapses across all of them — so **grouped and `--flat` counts legitimately differ**, and a gap is not a bug. Until July 2026 the bare scope was skipped entirely: `build_groups()` dropped `seq` for bare rows and the render loop `continue`d past `dedup()`, so top-level duplicates printed twice. Both halves of that fix have to stay — the `seq` is what lets `materialize()` pick a winner. |
 | `-A` dedup spans the week | A task on Monday restated on Friday collapses to one row with Friday's status. Falls out of `materialize()`'s last-occurrence rule — but only because the seven notes are read in date order and `seq` is **offset to keep climbing between notes**. `parse_note()` restarts `seq` at 0 per call; drop the offset and "last in page order" silently becomes "last in whichever note". |
-| `-A` drops day attribution | Deliberate. It answers *what happened this week*, not *when* — a by-day layout was considered and rejected. The date picks the week, the weekday is ignored, and `weekday` is `null` in JSON. |
+| `-A` drops day attribution | Deliberate. It answers *what happened this week*, not *when* — a by-day layout was considered and rejected. The date picks the week, the weekday is ignored, and `weekday` is `null` in JSON. `--order page` is the one exception, and only implicitly: the dailies are parsed in date order, so page order reads chronologically. Still no labels, and no by-day layout. |
+| Order is `--order`, structure is `--flat` | Two axes, two flags, and they must stay apart. `--flat` used to carry an alphabetical-only sort of its own and had silently drifted from the grouped view's `(rank, name)` — nobody chose that, it was just never noticed, because with no config everything is `UNRANKED` and the two coincide. All three sorts now go through `order_rows()`. |
+| `--order page` is the deduped page order | Not a transcript. A cluster sits at its **first** member's position while showing its **last** member's status — `dedup()` returns both, `materialize()` supplies the status half. A project group has no position of its own (its header carries no `seq`, and a merged group has several), so it sits at its earliest child. Bare rows must be re-interleaved with groups after the fact: `build_groups()` emits them in note order, but the bare dedup scope strands them after the last project until `order_rows()` puts them back. |
 | `-A` drops `**future**` | Via `parse_note(skip_future=True)`, which **only** `-A` passes. Single-day output still shows future buckets, unchanged. See finding 8. |
 | `-A` never reads the weekly note | Dailies only. That is why `tcat` has no `-W/--no-weekly`: unlike `tdiff`, plan and actual never share an aggregate, so there is nothing to switch off. |
 | Colour is marker-only | The whole `[x]` marker, brackets included — tinting only the inner char was tried in July 2026 and reverted; it reads as half-lit. Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
 | Footer is always three fields | `contents · mode · file(s)`, in every mode including `--missio` (whose `contents` is the literal `text`). Projects fold into `contents` rather than taking a field. `--no-summary` drops the whole line, date included. |
 | The file field names what was read | So `-P` shows the weekly note, not the invoked day; `-A` names the week plus `(n/7 dailies)` because it never opens the weekly note. |
-| `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-P`/`-f`/`-S`/`--routines`/`-A` are ignored. |
+| `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-P`/`--flat`/`--order`/`-S`/`--routines`/`-A` are ignored. |
 | `--missio` JSON is minimal | Exactly `{"week", "missio"}` — deliberately *not* the task envelope. `missio` is `null` for missing note, missing heading, or empty body. |
 
 ### The plan flag is `-P`, not `-w`

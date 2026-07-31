@@ -477,18 +477,45 @@ def build_groups(records):
     return tops
 
 def dedup(items):
-    """Reduce (status, name, seq) triples to one (status, name) per logical task.
+    """Reduce (status, name, seq) triples to one (status, name, pos) per logical task.
 
-    Position is what decides the winner, so the seq is consumed here and never
-    escapes: every caller sorts by (status rank, name), never by page order.
+    A cluster's *last* member decides the status (materialize's rule — within one note
+    the last statement is the current one) while its *first* decides `pos`. So a task
+    written Monday and restated Friday sits in Monday's slot wearing Friday's status.
+    That asymmetry is what makes `--order page` mean "where the note first raised it",
+    which is the only reading under which a deduped list can claim a page order at all.
     """
     if not items:
         return []
-    tasks, order = materialize(cluster_records([(n, s, q) for s, n, q in items]))
-    return [(tasks[n], n) for n in order]
+    clusters = cluster_records([(n, s, q) for s, n, q in items])
+    tasks, order = materialize(clusters)
+    first = {}
+    for members in clusters:
+        # materialize keys on the last member's base; key `first` the same way or the
+        # two dicts don't line up.
+        first[max(members, key=lambda r: r[2])[0]] = min(r[2] for r in members)
+    return [(tasks[n], n, first[n]) for n in order]
 
 def sort_key(status, name):
     return (STATUS_ORDER.get(status, UNRANKED), name.lower())
+
+def order_rows(rows):
+    """Sort rows in place per --order. Every level of every view goes through here —
+    grouped tops, project children, flat — so the orders can't drift apart the way
+    --flat's alphabetical-only sort had drifted from the grouped view's.
+
+    Rows are tuples of (status, name, ...) with the page position **last**, whatever
+    sits between: `page` is the only mode that reads past the name, and it wants the
+    position. It can't just skip sorting — build_groups() emits groups and bare tasks
+    in note order, but the caller has to collect the bare ones into their own dedup
+    scope, which strands them after the last project until this puts them back.
+    """
+    if args.order == 'status':
+        rows.sort(key=lambda r: sort_key(r[0], r[1]))
+    elif args.order == 'alpha':
+        rows.sort(key=lambda r: r[1].lower())
+    else:
+        rows.sort(key=lambda r: r[-1])
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -518,9 +545,17 @@ parser.add_argument('-w', '--week-offset', type=str, default=None,
 parser.add_argument('--missio',         action='store_true',
                     help="show the week's mission — the weekly note's ### *Missio* "
                          "section, verbatim — instead of any tasks")
-parser.add_argument('-f', '--flat',     action='store_true',
-                    help='drop project grouping and promote children to top level, '
-                         'sorted alphabetically (the task set tdiff sees)')
+parser.add_argument('--flat',           action='store_true',
+                    help='drop project grouping and promote children to top level '
+                         '(the task set tdiff sees). Says nothing about order — that '
+                         'is --order, which applies here exactly as it does to the '
+                         'grouped view')
+parser.add_argument('--order',          choices=('status', 'alpha', 'page'), default='status',
+                    help="how to order rows: 'status' (default) ranks by "
+                         '[order].statuses then alphabetically, at every level; '
+                         "'alpha' is alphabetical only; 'page' is the order the note "
+                         'wrote them in. Under -A that makes page order chronological, '
+                         'since the dailies are read in date order')
 parser.add_argument('-S', '--status',   type=str, default=None,
                     help="show only tasks whose status is in the given set "
                          "(concatenated chars, e.g. 'x-#'); prefix '^' to invert "
@@ -875,13 +910,15 @@ else:
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
 
-rows = []          # (status, name, children) — children None for a bare task
+# (status, name, children, pos) — children None for a bare task, pos the page
+# position order_rows() needs. Both are dropped before rendering.
+rows = []
 if args.flat:
     flat = [(s, n, q) for _, s, n, q in records if s not in PROJECT_STATUSES]
-    for status, name in dedup(flat):
+    for status, name, pos in dedup(flat):
         if status_match(status):
-            rows.append((status, name, None))
-    rows.sort(key=lambda r: r[1].lower())   # --flat: alphabetical only
+            rows.append((status, name, None, pos))
+    order_rows(rows)
 else:
     # Dedup is scoped, and the scopes never merge into one another: every project's
     # children collapse among themselves, and the bare tasks collapse among
@@ -896,15 +933,17 @@ else:
         if children is None:
             bare.append((status, name, seq))
             continue
-        kids = [(s, n) for s, n in dedup(children) if status_match(s)]
-        kids.sort(key=lambda k: sort_key(k[0], k[1]))
+        kids = [k for k in dedup(children) if status_match(k[0])]
+        order_rows(kids)
         # A project whose every child was filtered out is not worth a header.
         if kids:
-            rows.append((status, name, kids))
-    for status, name in dedup(bare):
+            # A header carries no seq of its own (and a merged group has several), so
+            # the group sits where its earliest task does — its first appearance.
+            rows.append((status, name, kids, min(q for _, _, q in children)))
+    for status, name, pos in dedup(bare):
         if status_match(status):
-            rows.append((status, name, None))
-    rows.sort(key=lambda r: sort_key(r[0], r[1]))
+            rows.append((status, name, None, pos))
+    order_rows(rows)
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
@@ -916,23 +955,25 @@ if args.json:
         'week': week_label,
         'source': source,
         'notes': notes_read,
+        # The envelope is {"status", "name", "children"} and tdiff parses it — page
+        # position is an ordering detail of this run, so it stays out.
         'tasks': [
             {'status': s, 'name': n,
-             'children': None if k is None else [{'status': cs, 'name': cn} for cs, cn in k]}
-            for s, n, k in rows
+             'children': None if k is None else [{'status': cs, 'name': cn} for cs, cn, _ in k]}
+            for s, n, k, _ in rows
         ],
     }, ensure_ascii=False, indent=2))
     sys.exit(0)
 
 leaves = 0
 seen_statuses = set()
-for status, name, kids in rows:
+for status, name, kids, _ in rows:
     seen_statuses.add(status)
     print(row(status, name, '  '))
     if kids is None:
         leaves += 1
         continue
-    for cs, cn in kids:
+    for cs, cn, _ in kids:
         seen_statuses.add(cs)
         print(row(cs, cn, '      '))
         leaves += 1
@@ -946,7 +987,7 @@ if not rows:
 report_unlisted(seen_statuses)
 
 if not args.no_summary:
-    groups = sum(1 for _, _, k in rows if k is not None)
+    groups = sum(1 for _, _, k, _ in rows if k is not None)
     contents = f"{leaves} task" + ('' if leaves == 1 else 's')
     if groups:
         # Projects join `contents` rather than taking a field of their own, so the

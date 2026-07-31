@@ -5,7 +5,7 @@ Show one day's tasks from an Obsidian vault.
 A single-file Python CLI that prints the tasks for a single day — either from that day's
 daily note (`<YYYY-MM-DD>`) or from the weekly planning note's (`YYYY-W##`) allocation
 for that weekday. Projects are grouped, duplicates are collapsed, and rows are sorted by
-status.
+status — or alphabetically, or in the note's own order, via `--order`.
 
 Two flags widen the lens to the week: `-A` merges the whole week's allocation into one
 list, and `--missio` prints the week's stated mission.
@@ -31,6 +31,10 @@ The output and configuration were reworked. If you used an earlier build:
   is always `nothing to show`. The `reason` key is gone from `--json` too.
 - **The header moved to the bottom.** Output now starts with the first task; context lives
   in a single footer line. `--no-summary` suppresses that whole line, date included.
+- **`-f` is gone; the flag is `--flat`.** It also no longer implies an order — it used to
+  sort alphabetically on its own, which had quietly drifted from the grouped view. Order
+  is now `--order`, and `--flat` defaults to the same `status` order as everything else.
+  `--flat --order alpha` is the old behaviour.
 
 ## Requirements
 
@@ -59,7 +63,8 @@ tcat yesterday          # yesterday's daily note
 tcat tuesday            # the most recent Tuesday
 tcat -P tuesday         # what the weekly plan allocated to that Tuesday
 tcat -P tomorrow        # tomorrow's allocation (no daily note exists yet)
-tcat 2026-03-04 --flat  # flat alphabetical list, no project grouping
+tcat 2026-03-04 --flat  # one list, no project grouping
+tcat --order page       # in the order the note wrote them
 tcat -S x               # only completed tasks
 tcat -A                 # everything actually done across this whole week
 tcat -A -P              # everything the plan allocated for it
@@ -106,7 +111,8 @@ relative form is `-w N`: `-w -1` is last week, `-w 0` the date's own week.
 | `-A`, `--all-week` | the whole week as one deduplicated list: the week's seven daily notes, or with `-P` the weekly note's Actio plan. The date picks the week; its weekday is ignored |
 | `-w N`, `--week-offset N` | select the week N weeks away (`-1` = last week). Only applies to `-A` and `--missio` |
 | `--missio` | print the weekly note's `### *Missio*` section verbatim instead of any tasks |
-| `-f`, `--flat` | drop project grouping, promote children to top level, sort alphabetically |
+| `--flat` | drop project grouping, promote children to top level. Says nothing about order — that is `--order` |
+| `--order MODE` | `status` (default) ranks by `[order].statuses` then alphabetically; `alpha` is alphabetical only; `page` is the order the note wrote them in |
 | `-S SET` | show only these status chars; prefix `^` to invert. Overrides hidden statuses |
 | `-I`, `--ignore` | hide settled tasks — the statuses in `[roles].settled` — leaving only what is still open |
 | `--routines` | include `#routine` tasks (excluded by default) |
@@ -176,11 +182,32 @@ seeing — and a top-level occurrence never swallows a project's copy.
 **Links are cleaned.** `[[note|alias]]` → `alias`, `[[folder/note]]` → `note`,
 `[text](url)` → `text`.
 
-`--flat` undoes the first two levels of that: no project headers, children promoted,
-sorted alphabetically. This is the task set `tdiff` sees for the same date. Having no
-projects, it also has no scopes, so it collapses across all of them — which is why `--flat`
-can show *fewer* rows than the grouped view of the same day. That is the two views
-answering different questions, not a discrepancy.
+`--flat` undoes the first two levels of that: no project headers, children promoted. This
+is the task set `tdiff` sees for the same date. Having no projects, it also has no scopes,
+so it collapses across all of them — which is why `--flat` can show *fewer* rows than the
+grouped view of the same day. That is the two views answering different questions, not a
+discrepancy.
+
+### Order
+
+Structure and order are separate flags. `--flat` says whether project headers are there;
+`--order` says how rows are arranged, and applies to the grouped and flat views alike —
+top level and project children both.
+
+| `--order` | arrangement |
+| --- | --- |
+| `status` (default) | rank from `[order].statuses`, then alphabetically within a rank |
+| `alpha` | alphabetically, ignoring status |
+| `page` | the order the note wrote them in |
+
+With no config there are no ranks, so everything is `UNRANKED` and `status` degrades to
+`alpha` on its own.
+
+`page` is the order of the *deduplicated* list, not a transcript of the note. A task
+raised once and restated later collapses to a single row that sits at the **first**
+mention while showing the **last** status. Under `-A` that makes the week read
+chronologically — the seven dailies are parsed in date order — which is the one place
+`tcat` will show you when something happened; the default orders deliberately do not.
 
 ### Colour
 
@@ -208,7 +235,8 @@ date is what actually happened, `-P` is what was planned — so there are two of
 | `tcat -A -P` | the weekly note's **Actio** | what was this week supposed to be |
 
 Same grouping, same dedup, same sorting as a single day. Only the source widens, and the
-footer names the week:
+footer names the week. `--order page` is the one place the week reads chronologically —
+the dailies are parsed in date order — and there are still no day labels:
 
 ```
 $ tcat -A 2026-03-04
@@ -271,7 +299,8 @@ an empty body. Exit status is 0 in every case.
 
 ## Status order
 
-Rows sort by status rank first, then alphabetically. **There are no built-in ranks** — the
+Rows sort by status rank first, then alphabetically — that is `--order status`, the
+default; see [Order](#order) for the other two. **There are no built-in ranks** — the
 order comes from `[order].statuses`, a single ordered list where rank *is* position. Ties
 cannot be expressed and reordering means moving a string.
 
