@@ -123,14 +123,26 @@ def week_span(d):
     week_num = ((sun - jan1).days + days_back) // 7 + 1
     return sun, sat, f"{sat.year}-W{week_num:02d}"
 
+_WEEK_REL_RE   = re.compile(r'[wW]([-+]\d+|0)$')
 _WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
 _WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
 
 def resolve_week_label(s):
-    """Return 'YYYY-W##' if s is a w## specifier, else None."""
+    """Return 'YYYY-W##' if s is a w## specifier, else None.
+
+    Three spellings, tried in this order. `w2026-W30` names a week outright. `w-1` / `w0`
+    / `w+1` are relative to the week containing today, and are what replaced the offset
+    flags both tools used to carry. `w30` is a bare week number in the current year.
+
+    The relative form has to be tried before the bare number, or `w0` would read as week
+    zero — a week no calendar has, and one that used to resolve to a phantom label.
+    """
     m = _WEEK_FULL_RE.fullmatch(s)
     if m:
         return m.group(1)
+    m = _WEEK_REL_RE.fullmatch(s)
+    if m:
+        return week_span(date.today() + timedelta(weeks=int(m.group(1))))[2]
     m = _WEEK_SHORT_RE.fullmatch(s)
     if m:
         return f'{date.today().year}-W{int(m.group(1)):02d}'

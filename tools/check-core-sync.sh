@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-PIN='123b5b1'
+PIN='92f195c'
 TDIFF_REPO="${1:-$HOME/Projects/tdiff}"
 TCAT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tcat"
 
@@ -22,12 +22,22 @@ die() { echo "check-core-sync: $*" >&2; exit 2; }
 [ -f "$TCAT" ]                || die "no tcat at $TCAT"
 [ -d "$TDIFF_REPO/.git" ]     || die "no tdiff git repo at $TDIFF_REPO (pass its path as \$1)"
 
-# The functions vendored verbatim. `materialize` is deliberately NOT here: tcat
-# reduces a cluster by page position, tdiff by STATUS_PRIORITY.
+# The functions vendored verbatim.
 #
 # `resolve_date` lives outside the marked block in both files — it needs `parser`,
 # so it has to sit after the argument parser — but it is checked all the same. The
 # two tools promising the same date arguments is only true if it cannot drift.
+#
+# Deliberately NOT checked, and why:
+#   materialize                       tcat reduces a cluster by page position, tdiff by
+#                                     STATUS_PRIORITY. The most important divergence.
+#   load_config config_paths _merge   $TCAT_CONFIG vs $TDIFF_CONFIG, and tcat survives
+#                                     with no config at all where tdiff hard-errors.
+#   die _on_uncaught _obsidian_once   every one embeds the literal tool name in a
+#   _run_obsidian prefetch            message it prints.
+#   flush_notices finish              same.
+#   build_groups dedup sort_key       tcat-only shape; tdiff groups inside its parser.
+#   order_rows status_match
 FUNCS=(
   strip_section_suffix
   _strip_wiki_path
@@ -38,6 +48,11 @@ FUNCS=(
   resolve_week_label
   _week_label_to_sunday
   resolve_date
+  parse_note
+  clean_text
+  _xdg_base
+  notice
+  restore
 )
 
 extract() {
@@ -78,8 +93,9 @@ for fn in "${FUNCS[@]}"; do
 done
 
 # Module-level constants copied alongside the functions.
-CONSTS=(_SEP_RE WIKILINK_RE _PUNCT _WEEK_SHORT_RE _WEEK_FULL_RE
-        _ISO_RE _OFF_RE _WEEKDAY_NAMES WEEKDAYS)
+CONSTS=(_SEP_RE WIKILINK_RE _PUNCT _WEEK_REL_RE _WEEK_SHORT_RE _WEEK_FULL_RE
+        _ISO_RE _OFF_RE _WEEKDAY_NAMES WEEKDAYS
+        TASK_RE H2_RE H3_RE MARK_RE MDLINK_RE WEEK_DAYS LADDER UNRANKED)
 for const in "${CONSTS[@]}"; do
   a="$(grep -m1 -E "^${const}[[:space:]]*= " "$tmp/tdiff" || true)"
   b="$(grep -m1 -E "^${const}[[:space:]]*= " "$TCAT" || true)"
