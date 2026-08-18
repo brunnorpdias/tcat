@@ -579,117 +579,97 @@ def extract_section(lines, name):
 
 # ── Grouping ──────────────────────────────────────────────────────────────────
 
-def build_groups(records):
-    """Fold flat (indent, status, name, seq) records into an ordered structure.
+def build_groups(note_records):
+    """Fold per-note (indent, status, name, seq) records into an ordered structure.
+
+    Takes one list per note, not one flat stream. `current` resets at every note
+    boundary, so a project header left open at the end of one note cannot adopt the
+    indented tasks at the start of the next — which a week read of eight notes would
+    otherwise do, silently. `index` deliberately does *not* reset: a project named in
+    several notes is still one merged group.
 
     Returns a list of (status, name, children, seq) where children is a list of
-    (status, name, seq); a bare task has children == None. Project groups merge
-    across the note (blocks are hidden, so five identical headers would be noise);
-    matching is case-insensitive because one note may write both [[Project Alpha]]
-    and [[project alpha]].
+    (status, name, seq); a bare task has children == None. Groups merge
+    case-insensitively because one note may write both [[Project Alpha]] and
+    [[project alpha]], and block markers are hidden, so five identical headers would
+    be noise.
 
-    A bare task keeps its seq because it still has to be deduped, and dedup picks
-    the winner by page position. A group header's seq is None: a header is never
+    A bare task keeps its seq because it still has to be deduped, and dedup picks the
+    winner by page position. A group header's seq is None: a header is never
     clustered, and a merged group has several of them anyway.
     """
-    tops, index, current = [], {}, None
-    for indent, status, name, seq in records:
-        if status in PROJECT_STATUSES and indent == 0:
-            key = name.lower()
-            if key in index:
-                current = index[key]
+    tops, index = [], {}
+    for records in note_records:
+        current = None
+        for indent, status, name, seq in records:
+            if status in PROJECT_STATUSES and indent == 0:
+                key = name.lower()
+                if key in index:
+                    current = index[key]
+                else:
+                    current = [status, name, [], None]
+                    index[key] = current
+                    tops.append(current)
+                continue
+            if indent > 0 and current is not None:
+                current[2].append((status, name, seq))
             else:
-                current = [status, name, [], None]
-                index[key] = current
-                tops.append(current)
-            continue
-        if indent > 0 and current is not None:
-            current[2].append((status, name, seq))
-        else:
-            current = None
-            tops.append([status, name, None, seq])
+                current = None
+                tops.append([status, name, None, seq])
     return tops
 
 def dedup(items):
-    """Reduce (status, name, seq) triples to one (status, name, pos) per logical task.
+    """Reduce (status, name, seq) triples to one (status, name) per logical task.
 
-    A cluster's *last* member decides the status (materialize's rule — within one note
-    the last statement is the current one) while its *first* decides `pos`. So a task
-    written Monday and restated Friday sits in Monday's slot wearing Friday's status.
-    That asymmetry is what makes `--order page` mean "where the note first raised it",
-    which is the only reading under which a deduped list can claim a page order at all.
+    A cluster's *last* member decides the status: within one note the last statement is
+    the current one, and across a week the last note to mention a task has the latest
+    word on it. `seq` says which member that is, which is why it survives even though
+    nothing downstream reads a position any more.
     """
     if not items:
         return []
     clusters = cluster_records([(n, s, q) for s, n, q in items])
     tasks, order = materialize(clusters)
-    first = {}
-    for members in clusters:
-        # materialize keys on the last member's base; key `first` the same way or the
-        # two dicts don't line up.
-        first[max(members, key=lambda r: r[2])[0]] = min(r[2] for r in members)
-    return [(tasks[n], n, first[n]) for n in order]
+    return [(tasks[n], n) for n in order]
 
 def sort_key(status, name):
     return (display_rank(status), name.lower())
 
 def order_rows(rows):
-    """Sort rows in place per --order. Every level of every view goes through here —
-    grouped tops, project children, flat — so the orders can't drift apart the way
-    --flat's alphabetical-only sort had drifted from the grouped view's.
-
-    Rows are tuples of (status, name, ...) with the page position **last**, whatever
-    sits between: `page` is the only mode that reads past the name, and it wants the
-    position. It can't just skip sorting — build_groups() emits groups and bare tasks
-    in note order, but the caller has to collect the bare ones into their own dedup
-    scope, which strands them after the last project until this puts them back.
-    """
-    if args.order == 'status':
-        rows.sort(key=lambda r: sort_key(r[0], r[1]))
-    elif args.order == 'alpha':
-        rows.sort(key=lambda r: r[1].lower())
-    else:
-        rows.sort(key=lambda r: r[-1])
+    """Sort rows by [order].statuses rank, then name. Every level of every view goes
+    through here — grouped tops and project children alike — so the two cannot drift
+    apart the way the old --flat sort had silently drifted from the grouped one."""
+    rows.sort(key=lambda r: sort_key(r[0], r[1]))
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(
     prog='tcat',
-    description="Show one day's tasks from an Obsidian daily or weekly note — "
-                "or, with -A, the whole week's; or, with --missio, the week's mission.",
+    description="Show what is in an Obsidian note: one day's tasks, or a whole week's.",
     epilog=(
-        'Dates accept YYYY-MM-DD, "today", "yesterday", "tomorrow", "0" (today), '
-        '-N / +N (e.g. -1 for yesterday), or a weekday name (monday..sunday, or '
-        'mon..sun), which resolves to its most recent occurrence at or before today. '
-        'w## / w2026-W## names a week instead of a day (e.g. w30) and needs -A or '
-        '--missio to say what to show for it.'
+        'A date names a day, a w## names a week, and a week has two sources you can '
+        'narrow to. Dates accept YYYY-MM-DD, "today", "yesterday", "tomorrow", "0" '
+        '(today), -N / +N (e.g. -1 for yesterday), or a weekday name (monday..sunday, '
+        'or mon..sun), which resolves to its most recent occurrence at or before today. '
+        'Weeks accept w## / w2026-W## (e.g. w30), or w0 / w-1 / w+1 relative to this '
+        'week. tdiff accepts exactly the same set — the resolver is shared code.'
     ),
 )
-parser.add_argument('date', nargs='?', default='today', help='the day to show (default: today)')
-parser.add_argument('-P', '--plan',     action='store_true',
-                    help="read the weekly note's Actio allocation for that day "
-                         '(the plan) instead of the daily note')
-parser.add_argument('-A', '--all-week', action='store_true',
-                    help="show the whole week as one merged, deduplicated list: the "
-                         "week's seven daily notes, or with -P the weekly note's Actio "
-                         'plan. The date picks the week; its weekday is ignored')
-parser.add_argument('-w', '--week-offset', type=str, default=None,
-                    help='select the week N weeks from the date (0 = its own week, '
-                         '-1 = the week before). Only applies to -A and --missio')
+parser.add_argument('date', nargs='?', default='today',
+                    help='the day or week to show (default: today)')
+# The positional picks the scope; -D/-W pick the source. A week has two of them, so
+# naming neither reads both — which is why naming both would be a second spelling of
+# the default, and why they are mutually exclusive.
+_source_flags = parser.add_mutually_exclusive_group()
+_source_flags.add_argument('-D', '--dailies', action='store_true',
+                    help="read only daily notes: on a w##, the week's seven; on a date, "
+                         'the daily note, which is already the default')
+_source_flags.add_argument('-W', '--weekly',  action='store_true',
+                    help="read only the weekly note's ### *Actio*: on a date, that "
+                         "weekday's allocation; on a w##, the whole week's plan")
 parser.add_argument('--missio',         action='store_true',
                     help="show the week's mission — the weekly note's ### *Missio* "
                          "section, verbatim — instead of any tasks")
-parser.add_argument('--flat',           action='store_true',
-                    help='drop project grouping and promote children to top level '
-                         '(the task set tdiff sees). Says nothing about order — that '
-                         'is --order, which applies here exactly as it does to the '
-                         'grouped view')
-parser.add_argument('--order',          choices=('status', 'alpha', 'page'), default='status',
-                    help="how to order rows: 'status' (default) ranks by "
-                         '[order].statuses then alphabetically, at every level; '
-                         "'alpha' is alphabetical only; 'page' is the order the note "
-                         'wrote them in. Under -A that makes page order chronological, '
-                         'since the dailies are read in date order')
 parser.add_argument('-S', '--status',   type=str, default=None,
                     help="show only tasks whose status is in the given set "
                          "(concatenated chars, e.g. 'x-#'); prefix '^' to invert "
@@ -705,8 +685,9 @@ parser.add_argument('--json',           action='store_true', help='machine-reada
 parser.add_argument('--no-color',       action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',     action='store_true', help='suppress the summary line')
 parser.add_argument('--config',         type=str, default=None,
-                    help='path to status config TOML; default resolution: $TCAT_CONFIG, '
-                         '$XDG_CONFIG_HOME/tcat/config.toml, then tdiff/config.toml')
+                    help='additional (merging) config layer, applied last; the layers '
+                         'below it are ~/.config/obsidian-tasks/statuses.toml, '
+                         '~/.config/tcat/config.toml, then $TCAT_CONFIG')
 
 # argparse chokes on bare negative numbers like -1 before we can process them;
 # intercept them and turn them into a safe token first.
@@ -768,38 +749,21 @@ def resolve_date(s):
     )
 
 # A week mode is anything whose subject is the week rather than one day.
-week_mode = args.all_week or args.missio
-
-# w30 / w2026-W30 name a week, not a day. There is no sensible single-day reading
-# of one, and guessing between "the week's tasks" and "the week's plan" would be
-# worse than asking.
+# w30 / w-1 / w2026-W30 name a week; anything else names a day. That is the whole
+# scope rule — -D/-W then pick which of a week's two sources to read.
 raw_date = restore(args.date)
 week_arg = resolve_week_label(raw_date)
-if week_arg and not week_mode:
-    parser.error(
-        f"{raw_date} names a week; add -A for its tasks, -A -P for its plan, "
-        f"or --missio for its mission"
-    )
 
-if args.week_offset is not None:
-    if not week_mode:
-        parser.error("-w/--week-offset only applies to -A or --missio")
-    if week_arg:
-        parser.error(f"cannot combine -w/--week-offset with {raw_date} — "
-                     f"both name a week")
-    try:
-        week_offset = int(restore(args.week_offset))
-    except ValueError:
-        parser.error(f"-w/--week-offset expects an integer, got {args.week_offset!r}")
-else:
-    week_offset = 0
+if args.missio and (args.dailies or args.weekly):
+    parser.error('--missio already reads the weekly note; -D/-W have nothing to narrow')
 
 if week_arg:
     target_d = _week_label_to_sunday(week_arg)
     # Not every YYYY-W## string is a week. Labels are named for the year a week
     # ends in, so `2026-W53` maps onto a Sunday whose week is really 2027-W01 —
     # a phantom that would otherwise be read as if it were real. Round-tripping
-    # the label through week_span() is what catches it.
+    # the label through week_span() is what catches it. A relative label needs no
+    # check: it came out of week_span() in the first place.
     real_label = week_span(target_d)[2]
     if real_label != week_arg:
         parser.error(f"{raw_date} is not a week in this calendar "
@@ -807,15 +771,14 @@ if week_arg:
     target = target_d.isoformat()
 else:
     target = resolve_date(raw_date)
-    target_d = date.fromisoformat(target) + timedelta(days=week_offset * 7)
-    target = target_d.isoformat()
+    target_d = date.fromisoformat(target)
 
-# Only the daily note is bound to a past date; every week mode may well have
-# something written for a week that hasn't arrived yet.
-if target_d > date.today() and not (args.plan or week_mode):
+# Only the daily note is bound to a day that has already happened. The weekly note may
+# well be written ahead of the week, so -W and any w## are free to look forward.
+if target_d > date.today() and not (args.weekly or week_arg):
     parser.error(
         f"{target} is in the future; a daily note won't exist yet. "
-        f"Use -P to read the weekly plan's allocation for that day."
+        f"Use -W to read the weekly note's allocation for that day."
     )
 
 status_filter = None
@@ -992,123 +955,140 @@ if args.missio:
         print(footer('text', 'missio', week_label))
     finish()
 
-records = []
-notes_read = []
-
-# ── The whole week, actually done ─────────────────────────────────────────────
+# ── Read plan ─────────────────────────────────────────────────────────────────
 #
-# -A without -P is the week-scale counterpart of a bare date: the seven daily
-# notes, merged. Missing days are ordinary — this vault averages six of seven —
-# so a gap is skipped and counted, never an error.
-if args.all_week and not args.plan:
-    source = 'daily'
-    week_names = [daily_name((week_sun + timedelta(days=i)).isoformat())
-                  for i in range(7)]
-    prefetch(week_names)
-    seq0 = 0
-    for name in week_names:
-        lines = obsidian_lines(name)
-        if not lines:
-            continue
-        notes_read.append(name)
-        # Page order across the seven notes is what makes dedup pick the latest
-        # day's status, so seq has to keep climbing between notes rather than
-        # restarting at 0 for each one.
-        recs = list(parse_note(lines, routines=args.routines, skip_future=True))
-        records += [(i, s, n, seq0 + q) for i, s, n, q in recs]
-        seq0 += len(recs)
-    # -A never opens the weekly note, so the file field names the week and states
-    # how much of it was actually on disk.
-    mode, note_field = 'all', f'{week_label} ({len(notes_read)}/7 dailies)'
+# One ordered list of (note, parse kwargs), built from the scope the positional named
+# and the source -D/-W asked for. Everything downstream reads it, so there is exactly
+# one place that decides what a given invocation opens.
 
+# A single day read on its own keeps its **future** bucket — deferring something is
+# part of that day. Folded into a week it goes, or a pre-split Sunday's bucket drags a
+# whole week of deferred work in beside what actually happened.
+DAY_KW        = {}
+WEEK_DAY_KW   = {'skip_future': True}
+# A whole week's plan takes the unallocated tasks too: `None` leads the whitelist and
+# catches everything under ### *Actio* that never got a **weekday** marker. On an
+# organised week it matches nothing; on a week still being drafted it is the entire
+# plan — 2026-W34 currently holds 37 such tasks and 0 allocated ones. A single day is
+# the opposite question, "what did I put on Monday", so it asks for the marker alone.
+WEEK_PLAN_KW  = {'region': 'actio', 'day': (None,) + WEEK_DAYS}
+
+if week_arg:
+    entries = []
+    # The weekly note leads. materialize() keeps the last occurrence in page order and
+    # seq climbs across notes, so reading the plan first is what lets every daily's
+    # statement beat it — the same precedence tdiff gets by giving the weekly note
+    # day_index 0 so it loses every tie.
+    if not args.dailies:
+        entries.append((WEEKLY_NAME, WEEK_PLAN_KW))
+    if not args.weekly:
+        entries += [(daily_name((week_sun + timedelta(days=i)).isoformat()), WEEK_DAY_KW)
+                    for i in range(7)]
 else:
-    if args.plan or args.all_week:
-        note_name = WEEKLY_NAME
-        source = week_label
-        # The weekly note is what gets read, so it — not the invoked day — is the
-        # file this output came from.
-        mode, note_field = ('all plan' if args.all_week else 'plan'), week_label
-    else:
-        note_name = daily_name(target)
-        source = 'daily'
-        mode, note_field = 'daily', target
+    entries = ([(WEEKLY_NAME, {'region': 'actio', 'day': WEEKDAY_NAME})] if args.weekly
+               else [(daily_name(target), DAY_KW)])
 
-    lines = obsidian_lines(note_name)
-    if lines:
-        notes_read.append(note_name)
-        if args.plan or args.all_week:
-            records = list(parse_note(lines, region='actio',
-                                      day=WEEK_DAYS if args.all_week else WEEKDAY_NAME,
-                                      routines=args.routines))
-        else:
-            records = list(parse_note(lines, routines=args.routines))
+prefetch([n for n, _ in entries])
+
+# Grouped per note, because build_groups() must not let a project header left open at
+# the end of one note adopt the indented tasks at the start of the next.
+note_records, notes_read, seq0 = [], [], 0
+for name, kw in entries:
+    lines = obsidian_lines(name)
+    # A missing day is ordinary — this vault averages six notes in seven — so a gap is
+    # skipped and counted, never an error.
+    if not lines:
+        continue
+    notes_read.append(name)
+    recs = list(parse_note(lines, routines=args.routines, **kw))
+    # parse_note restarts seq at 1 every call, so the offset is applied here and
+    # advanced by what the note actually yielded. Drop it and "last in page order"
+    # quietly becomes "last in whichever note".
+    note_records.append([(i, s, n, seq0 + q) for i, s, n, q in recs])
+    seq0 += len(recs)
+
+dailies_read = sum(1 for n in notes_read if n != WEEKLY_NAME)
+if week_arg:
+    source = week_label
+    if args.weekly:
+        mode, note_field = 'week plan', week_label
+    elif args.dailies:
+        mode, note_field = 'week dailies', f'{week_label} ({dailies_read}/7 dailies)'
+    else:
+        mode = 'week'
+        seen_weekly = ', weekly' if WEEKLY_NAME in notes_read else ''
+        note_field = f'{week_label} ({dailies_read}/7 dailies{seen_weekly})'
+elif args.weekly:
+    source = week_label
+    # The weekly note is what gets read, so it — not the invoked day — is the file
+    # this output came from.
+    mode, note_field = 'plan', week_label
+else:
+    source = 'daily'
+    mode, note_field = 'daily', target
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
 
-# (status, name, children, pos) — children None for a bare task, pos the page
-# position order_rows() needs. Both are dropped before rendering.
+# (status, name, children) — children None for a bare task. Output is always grouped
+# and always ordered by [order].statuses then name; structure and order stopped being
+# flags because neither had a second setting worth keeping.
+#
+# Dedup is scoped, and the scopes never merge into one another: every project's
+# children collapse among themselves, and the bare tasks collapse among themselves.
+# So a task written under two projects keeps a row under each — the header is real
+# context — and a bare occurrence never swallows a project's copy. Bare tasks are
+# collected rather than emitted inline because dedup needs the whole scope at once.
 rows = []
-if args.flat:
-    flat = [(s, n, q) for _, s, n, q in records if s not in PROJECT_STATUSES]
-    for status, name, pos in dedup(flat):
-        if status_match(status):
-            rows.append((status, name, None, pos))
-    order_rows(rows)
-else:
-    # Dedup is scoped, and the scopes never merge into one another: every project's
-    # children collapse among themselves, and the bare tasks collapse among
-    # themselves. So a task written under two projects keeps a row under each — the
-    # header is real context — and a bare occurrence never swallows a project's copy.
-    # (--flat has no scopes and therefore collapses across all of them; that is why
-    # its leaf count can be lower than this branch's, which is not a discrepancy.)
-    # Bare tasks are collected rather than emitted inline because dedup needs to see
-    # the whole scope at once.
-    bare = []
-    for status, name, children, seq in build_groups(records):
-        if children is None:
-            bare.append((status, name, seq))
-            continue
-        kids = [k for k in dedup(children) if status_match(k[0])]
-        order_rows(kids)
-        # A project whose every child was filtered out is not worth a header.
-        if kids:
-            # A header carries no seq of its own (and a merged group has several), so
-            # the group sits where its earliest task does — its first appearance.
-            rows.append((status, name, kids, min(q for _, _, q in children)))
-    for status, name, pos in dedup(bare):
-        if status_match(status):
-            rows.append((status, name, None, pos))
-    order_rows(rows)
+bare = []
+for status, name, children, _ in build_groups(note_records):
+    if children is None:
+        bare.append((status, name, _))
+        continue
+    kids = [k for k in dedup(children) if status_match(k[0])]
+    order_rows(kids)
+    # A project whose every child was filtered out is not worth a header.
+    if kids:
+        rows.append((status, name, kids))
+for status, name in dedup(bare):
+    if status_match(status):
+        rows.append((status, name, None))
+order_rows(rows)
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
 if args.json:
+    json_rows = []
+    for _s, _n, _k in rows:
+        if _k is None:
+            json_rows.append({'status': _s, 'name': _n})
+            continue
+        # A project header is context, not work: it survives as the `project` key on
+        # its children rather than as a row of its own. Same as tdiff.
+        for _cs, _cn in _k:
+            json_rows.append({'status': _cs, 'name': _cn, 'project': _n})
     print(json.dumps({
+        'mode': mode,
         'date': target,
-        # -A spans the whole week, so no single weekday describes the payload.
-        'weekday': None if args.all_week else WEEKDAY_NAME,
+        # A week spans seven days, so no single weekday describes the payload.
+        'weekday': None if week_arg else WEEKDAY_NAME,
         'week': week_label,
-        'source': source,
-        'notes': notes_read,
-        # The envelope is {"status", "name", "children"} and tdiff parses it — page
-        # position is an ordering detail of this run, so it stays out.
-        'tasks': [
-            {'status': s, 'name': n,
-             'children': None if k is None else [{'status': cs, 'name': cn} for cs, cn, _ in k]}
-            for s, n, k, _ in rows
-        ],
+        'files': notes_read,
+        # Flat, with the project named on each row rather than nested children —
+        # tdiff's shape, so a consumer reading both tools learns one vocabulary.
+        # Grouping stays a rendering concern.
+        'rows': json_rows,
     }, ensure_ascii=False, indent=2))
     finish()
 
 leaves = 0
 seen_statuses = set()
-for status, name, kids, _ in rows:
+for status, name, kids in rows:
     seen_statuses.add(status)
     print(row(status, name, '  '))
     if kids is None:
         leaves += 1
         continue
-    for cs, cn, _ in kids:
+    for cs, cn in kids:
         seen_statuses.add(cs)
         print(row(cs, cn, '      '))
         leaves += 1
@@ -1121,7 +1101,7 @@ if not rows:
 report_unlisted(seen_statuses)
 
 if not args.no_summary:
-    groups = sum(1 for _, _, k, _ in rows if k is not None)
+    groups = sum(1 for _, _, k in rows if k is not None)
     contents = f"{leaves} task" + ('' if leaves == 1 else 's')
     if groups:
         # Projects join `contents` rather than taking a field of their own, so the
