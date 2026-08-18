@@ -31,7 +31,7 @@ whole design. Re-verify before changing the reader; don't re-derive from scratch
    that string explicitly — checking the exit code is not enough.
 
 6. **Older weekly notes predate the day ladder.** Their `### *Actio*` is one flat week
-   list with no `**day**` markers (two such notes in testing held 36 and 46 tasks). `-P`
+   list with no `**day**` markers (two such notes in testing held 36 and 46 tasks). `-W`
    correctly returns nothing for a specific day, and says only `nothing to show` — the
    distinct explanation `-v` used to give was removed along with the flag.
 
@@ -47,12 +47,12 @@ whole design. Re-verify before changing the reader; don't re-derive from scratch
    Measured over the last eight full weeks: 7,6,5,4,7,5,7,7 notes. A week aggregator must
    treat a missing day as ordinary, never an error. Worse, before W20 the weekly structure
    lived inside the Sunday daily — `tcat 2026-05-17` returns **90 tasks** because that note
-   carries the coming week's whole plan inside a fence. `-A` drops `**future**` (20 of them
-   in that note) which removes the largest slice; the rest is a documented known gap.
+   carries the coming week's whole plan inside a fence. A week read drops `**future**` (20 of
+   them in that note) which removes the largest slice; the rest is a documented known gap.
    Do **not** "fix" it with fence tracking — see finding 4.
 
 9. **The `obsidian` CLI intermittently wedges.** A read that normally takes ~10 ms
-   occasionally hangs for minutes. Observed directly while building `-A`. It also **drains
+   occasionally hangs for minutes. Observed directly while building the week aggregation. It also **drains
    stdin**, so every call needs `stdin=DEVNULL` or `tcat` eats its caller's input. Both are
    handled in `_read_uncached()` (cap, retry, skip) — the same reasons `tdiff` guards its
    calls. Don't remove either.
@@ -63,31 +63,44 @@ whole design. Re-verify before changing the reader; don't re-derive from scratch
 
 ## What this project does
 
-`tcat` is a single-file Python CLI that shows **one day's tasks** — from that day's daily
-note (`<YYYY-MM-DD>`) or, with `-P`, from the weekly note's (`YYYY-W##`) Actio allocation
-for that weekday. Two flags widen the lens to the week without changing what the tool is
-for: `-A` merges a whole week into one list — the seven daily notes, or with `-P` the
-weekly Actio plan — and `--missio` prints the weekly note's mission prose.
+`tcat` is a single-file Python CLI that shows **what is in a note**: one day's tasks, or
+one week's. `--missio` prints the weekly note's mission prose instead.
 
-**`-A` mirrors the existing polarity, and that is the whole point.** Bare date = actual,
-`-P` = plan; `-A` = actual week, `-A -P` = planned week. An earlier draft made `-A`
-plan-only; that was wrong and was corrected before release. Don't re-collapse it.
+**The grammar is one sentence, and it is tdiff's: a date names a day, a `w##` names a
+week, and a week has two sources you narrow with `-D`/`-W`.** The positional picks the
+scope, the flags pick the source.
+
+| invocation | reads |
+|---|---|
+| `tcat today` / `tcat today -D` | that day's daily note |
+| `tcat today -W` | the weekly note's Actio allocation for that weekday |
+| `tcat w34` | the whole week, both sources merged and deduped |
+| `tcat w34 -D` | the week's seven daily notes |
+| `tcat w34 -W` | the week's Actio plan, whole |
+
+`-D` on a date is a documented no-op — a day's daily note is already the default. It
+exists so the two flags read as a pair rather than as one flag with a gap.
+
+**`-D`/`-W` are tdiff's letters with tdiff's polarity, and that is deliberate.** This
+used to be `-P/--plan`, on the argument that `-W` in tdiff meant *exclude the weekly
+note* — the opposite polarity on two tools run side by side. tdiff reversed that in
+`596020d`: `-W` now means *read only the weekly note*, which is exactly what `-P` meant.
+The collision the old name avoided no longer exists, so don't reintroduce `-P`. The same
+goes for `-A`, which was chosen over `-W` for the same now-void reason, and for `-w`,
+which tcat's docs claimed was "copied from tdiff exactly" when tdiff has never had it.
 
 Sibling to `tdiff`. **`tdiff` answers *what changed*; `tcat` answers *what is there*.**
 `tcat` never compares two sources — every comparison stays with `tdiff`. Resist requests
 to add plan-vs-daily columns, drift markers, or diffing of any kind; that is `tdiff`'s job
 and the separation is deliberate.
 
-**The separation now has a seam, so there is no reason to breach it.** `tdiff -E` takes
-shell commands as its two sides, so plan-vs-actual is one invocation:
-
-```bash
-tdiff -E 'tcat today -P' 'tcat today -I'
-```
-
-`tcat` needs to do nothing for this to work beyond what it already does: emit `--json`.
-Keep that envelope stable — `{"tasks": [{"status", "name", "children"}]}` — because
-`tdiff` parses it. Changing the key names is a breaking change for both tools.
+**The seam now lives entirely inside `tdiff`, and `tcat` owes it nothing.** Plan-vs-actual
+is `tdiff today -W`: tdiff reads the weekly note's Actio section itself now, so it no
+longer needs tcat to hand it a task set. `tdiff -E`, which used to take shell commands as
+its two sides, was deleted in `596020d` — and with it the only consumer of tcat's nested
+`--json` envelope. That envelope is now flat `rows` in tdiff's shape, and nothing parses
+it; earlier docs here said to freeze it "because `tdiff` parses it", which stopped being
+true and is the reason the shape was free to change.
 
 External dependencies: `obsidian` CLI (`read` subcommand only). Requires Python 3.11+
 (stdlib `tomllib`). No `rg` — unlike `tdiff`, `tcat` parses note source directly.
@@ -95,19 +108,17 @@ External dependencies: `obsidian` CLI (`read` subcommand only). Requires Python 
 ## Running
 
 ```bash
-tcat [date] [flags]                # no build step
+tcat [date|w##] [flags]            # no build step
 
 python3 tcat 2026-03-04 --no-color
-python3 tcat -P tuesday --no-color
-python3 tcat 2026-03-04 --flat --no-color
-python3 tcat 2026-03-04 --order page --no-color
-python3 tcat -A w30 --order page --flat --no-color   # the week, chronologically
-python3 tcat -P 2026-01-07 --no-color      # pre-ladder week, empty
+python3 tcat tuesday -W --no-color         # tuesday's allocation in the weekly plan
+python3 tcat 2026-01-07 -W --no-color      # pre-ladder week, empty
 python3 tcat 2026-03-04 --json
-python3 tcat -A --no-color                 # the week actually done, merged
-python3 tcat -A -P --no-color              # the week as planned
-python3 tcat -A w30 --no-color             # a week by number
-python3 tcat -A -w -1 --flat --json        # last week
+python3 tcat w30 --no-color                # a week, both sources merged
+python3 tcat w30 -D --no-color             # the week actually done
+python3 tcat w30 -W --no-color             # the week as planned
+python3 tcat w0 --no-color                 # this week
+python3 tcat w-1 -D --json                 # last week's dailies
 python3 tcat --missio --no-color           # the week's mission, verbatim
 python3 tcat 2026-06-10 --missio           # a week with no Missio section
 ```
@@ -121,8 +132,8 @@ One executable file: `tcat`. Pipeline:
 1. **Read** — `read_note()` shells out to `obsidian read file=<name>`, returns lines or
    `None`. See finding 5 about the missing-file detection, and finding 9 for the timeout,
    retry and `stdin=DEVNULL` guards. Results are memoised; `prefetch()` warms several notes
-   at once through a 4-worker pool (`TCAT_WORKERS`) and is called only by `-A`, so
-   single-note modes cost exactly what they always did.
+   at once through a 4-worker pool (`TCAT_WORKERS`). It is now called on every path, since
+   the read plan is one list of notes; a single-note run takes the serial branch.
 
    `survey_region()` used to sit here, existing only to tell empty results apart for `-v`.
    Both are gone — see **Key behaviours**.
@@ -130,7 +141,7 @@ One executable file: `tcat`. Pipeline:
 2. **Parse** — `parse_note()` yields `(indent, status_char, name, seq)`. Fence-agnostic
    (finding 4). In weekly mode it filters to `region='actio'` and a ladder day; in daily
    mode it yields everything. `day=` takes one marker name **or a tuple** of them —
-   `-A` passes `WEEK_DAYS`, which is why the whole week is one pass and not seven.
+   a week read passes `(None,) + WEEK_DAYS`, which is why the whole plan is one pass.
    `LADDER` is derived from `WEEK_DAYS` so the two can't drift.
    `extract_section()` is the prose counterpart: it returns one `###` section's body
    verbatim (`None` when the heading is absent, `''` when the body is), and is what
@@ -151,34 +162,65 @@ One executable file: `tcat`. Pipeline:
    by `STATUS_PRIORITY`. Within one note the last statement is the current one. This is
    the single most important difference from `tdiff` and is marked in the source.
 
-5. **Sort & render** — `order_rows()` at every level, per `--order`; the default is
-   `(STATUS_ORDER rank, name.lower())`. `--flat` drops project parents and nothing else —
-   **structure and order are separate flags**, and welding them is what went wrong before
-   (`--flat` carried its own alphabetical-only sort and had quietly drifted from the
-   grouped view). Every sort in the output path goes through `order_rows()` so they can't
-   drift again. `row()` colours the status marker only,
-   except for `FULL_ROW` statuses (`x`, `-`) which take the colour across the whole line;
-   `footer()` emits the single context line, always `contents · mode · file(s)`.
+5. **Sort & render** — `order_rows()` at every level: `(display_rank, name.lower())`,
+   and nothing else. Output is always grouped and always in that order — `--flat` and
+   `--order` are both gone, and neither should come back as a flag. `--flat`'s stated
+   purpose ("the task set `tdiff` sees") stopped being true when `tdiff` started grouping
+   by project too, and it carried a second dedup scoping rule that made its counts
+   legitimately differ from the grouped view. `--order` had three modes of which one
+   (`alpha`) was indistinguishable from the default without a config, and one (`page`)
+   forced a page position through the whole pipeline to serve only itself. Every sort in
+   the output path goes through `order_rows()`, so the levels can't drift apart the way
+   `--flat`'s private alphabetical sort silently had. `row()` colours the status marker
+   only, except for `FULL_ROW` statuses (`x`, `-`) which take the colour across the whole
+   line; `footer()` emits the single context line, always `contents · mode · file(s)`.
+
+6. **Read plan** — one ordered list of `(note, parse kwargs)` built from the scope the
+   positional named and the source `-D`/`-W` asked for, consumed by one loop. It is the
+   only place that decides what an invocation opens. `build_groups()` takes the records
+   **grouped per note**, so a project header left open at the end of one note cannot adopt
+   the indented tasks at the start of the next — a real hazard once a week read opens
+   eight notes, and one the old flat-stream `-A` was already exposed to.
 
 ## Vendored core
 
 The block between `# ── Vendored task core` and `# ── End vendored core` is copied
-verbatim from `tdiff` at pinned commit **`123b5b1`**: `strip_section_suffix`,
-`WIKILINK_RE`/`_strip_wiki_path`/`normalize_wikilinks`, `_PUNCT`/`_tokens`,
-`cluster_records`, `week_span`, `_SEP_RE`, and the week-selection set
-`resolve_week_label`/`_week_label_to_sunday`/`_WEEK_SHORT_RE`/`_WEEK_FULL_RE`.
+verbatim from `tdiff` at pinned commit **`92f195c`**. The checked surface is now
+**15 functions and 18 constants** — roughly twice what it was, because a large amount of
+genuinely shared code was sitting outside the guard:
+
+| group | names |
+|---|---|
+| task names | `strip_section_suffix`, `clean_text`, `normalize_wikilinks`, `_strip_wiki_path`, `WIKILINK_RE`, `MDLINK_RE`, `_SEP_RE` |
+| parsing | `parse_note`, `TASK_RE`, `H2_RE`, `H3_RE`, `MARK_RE`, `WEEK_DAYS`, `LADDER` |
+| clustering | `cluster_records`, `_tokens`, `_PUNCT` |
+| dates & weeks | `week_span`, `resolve_date`, `resolve_week_label`, `_week_label_to_sunday`, `_WEEK_REL_RE`, `_WEEK_SHORT_RE`, `_WEEK_FULL_RE`, `_ISO_RE`, `_OFF_RE`, `_WEEKDAY_NAMES`, `WEEKDAYS` |
+| display & plumbing | `display_rank`, `UNRANKED`, `_xdg_base`, `notice`, `restore` |
+
+**`parse_note` came *from* `tcat`**, but `tdiff` is the canonical side now: it moved off
+`obsidian tasks` onto raw markdown in `596020d` and took tcat's parser with it. Both
+copies are identical; the pin is what says which one wins a disagreement.
+
+**`clean_text` was the one function that had genuinely drifted**, and reconciling it was a
+real fix rather than a formality. `tcat` used to reduce links to their display text
+*before* stripping the ` – …` section suffix, which truncated any linked title containing
+a dash. Measured on this vault: 106 of 435 names rendered differently, 22 of them losing
+text outright. It is now `tdiff`'s: un-escape → `strip_section_suffix` → shorten wikilink
+paths, brackets kept → reduce markdown links. Names therefore display as
+`read [[2026 mechanica]]`, which is a visible change and the right one.
 
 **`resolve_date` is checked too, but lives outside the block** — in both files, because it
 needs `parser` and so has to follow the argument parser. It is vendored all the same: the
 promise that `tcat` and `tdiff` take the same date arguments (weekday names, `tomorrow`,
-`-N`/`+N`) is only true if it cannot drift. `_ISO_RE`, `_OFF_RE`, `_WEEKDAY_NAMES` and
-`WEEKDAYS` come with it; the latter two are deliberately one-liners, because the script's
-constant check compares a single assignment line and a multi-line `WEEKDAYS` would have
-been checked only on its first.
+`-N`/`+N`, `w##`, `w-1`) is only true if it cannot drift. `_WEEKDAY_NAMES` and `WEEKDAYS`
+are deliberately one-liners, because the script's constant check compares a single
+assignment line and a multi-line `WEEKDAYS` would have been checked only on its first.
+`UNRANKED` carries no trailing comment in either file for the same reason — `tdiff` moved
+its comment to the line above so the two assignment lines match exactly.
 
 One deliberate divergence, and it is in the caller rather than the function: `tcat`
-hard-errors on a future date without `-P`, since the daily note won't exist yet. `tdiff`
-accepts it — an empty side is a legitimate diff.
+hard-errors on a future date without `-W` (or a `w##`), since the daily note won't exist
+yet. `tdiff` accepts it — an empty side is a legitimate diff.
 
 **`is_same_task` is gone** — upstream folded it into `cluster_records`, which now buckets
 on the two merge keys instead of scanning all pairs. Same clusters, ~3× faster on `tdiff`'s
@@ -193,9 +235,14 @@ deployment model. Keep it honest with:
 tools/check-core-sync.sh [path-to-tdiff-repo]   # exit 1 on any drift
 ```
 
-`materialize` is deliberately **not** checked — see pipeline step 4. If you change
-anything inside the vendored block, either revert it or move it out of the block and
-document why.
+Deliberately **not** checked, and the script says why in a comment: `materialize` (tcat
+reduces a cluster by page position, tdiff by `STATUS_PRIORITY` — see pipeline step 4);
+`load_config`/`config_paths`/`_merge` (different env var, and tcat survives with no config
+where tdiff hard-errors); `die`/`_on_uncaught`/`_obsidian_once`/`_run_obsidian`/`prefetch`/
+`flush_notices`/`finish` (each prints the tool's own name); and
+`build_groups`/`dedup`/`sort_key`/`order_rows`/`status_match` (tcat-only shape — tdiff
+groups inside its own parser). If you change anything inside the vendored block, either
+revert it or move it out of the block and document why.
 
 ## Config
 
@@ -254,45 +301,21 @@ Lists replace wholesale; only tables merge (`_merge()`).
 | Behaviour | Note |
 |---|---|
 | Weekday names resolve **backwards** | `tuesday` = most recent Tuesday at or before today. A future weekday has no tasks yet. |
-| Future date without `-P` | Hard error — the daily note won't exist. |
+| Future date without `-W` | Hard error — the daily note won't exist. A `w##` or `-W` may look forward freely: the weekly note is often written ahead of the week. |
 | `&` `»` `«` hidden | Filtered **after** dedup, so an earlier `[»]` never suppresses a later `[x]`. `-S` overrides. |
 | `-I` hides `[roles].settled` | Boolean, like `tdiff`'s — *not* a char list; `-S` already covers that axis. Three filters compose (`hide`, `-I`, `-S`) under one rule: **a positive `-S` wins for the statuses it names**, so `-I -S x` shows done tasks rather than nothing. A negated `-S` names only what to drop, so `-I` still applies to the rest. No built-in set: unconfigured `-I` hides nothing and says so, like `[order].statuses`. |
 | `settled` is not `full_row` | They hold the same two chars by default and are still separate keys: `full_row` says how a row is *painted*, `settled` whether it is *there*. Welding them would make a colour edit silently change which tasks you see. |
 | Empty is never an error | Exit 0, one dim `nothing to show`, whatever the cause. `-v` and the eleven per-reason strings were removed deliberately; don't reinstate them. |
-| Fixa, `future`, `promissum` | Parsed as ladder markers so they can't leak into a day, but **not exposed** — including under `-A`. v1 is Actio days only. |
-| Dedup is **scoped**, not global | Each project's children collapse among themselves; bare top-level tasks collapse among themselves as one further scope. The scopes never merge, so a task under two projects keeps a row under each, and a bare occurrence never swallows a project's copy. `--flat` has no scopes and collapses across all of them — so **grouped and `--flat` counts legitimately differ**, and a gap is not a bug. Until July 2026 the bare scope was skipped entirely: `build_groups()` dropped `seq` for bare rows and the render loop `continue`d past `dedup()`, so top-level duplicates printed twice. Both halves of that fix have to stay — the `seq` is what lets `materialize()` pick a winner. |
-| `-A` dedup spans the week | A task on Monday restated on Friday collapses to one row with Friday's status. Falls out of `materialize()`'s last-occurrence rule — but only because the seven notes are read in date order and `seq` is **offset to keep climbing between notes**. `parse_note()` restarts `seq` at 0 per call; drop the offset and "last in page order" silently becomes "last in whichever note". |
-| `-A` drops day attribution | Deliberate. It answers *what happened this week*, not *when* — a by-day layout was considered and rejected. The date picks the week, the weekday is ignored, and `weekday` is `null` in JSON. `--order page` is the one exception, and only implicitly: the dailies are parsed in date order, so page order reads chronologically. Still no labels, and no by-day layout. |
-| Order is `--order`, structure is `--flat` | Two axes, two flags, and they must stay apart. `--flat` used to carry an alphabetical-only sort of its own and had silently drifted from the grouped view's `(rank, name)` — nobody chose that, it was just never noticed, because with no config everything is `UNRANKED` and the two coincide. All three sorts now go through `order_rows()`. |
-| `--order page` is the deduped page order | Not a transcript. A cluster sits at its **first** member's position while showing its **last** member's status — `dedup()` returns both, `materialize()` supplies the status half. A project group has no position of its own (its header carries no `seq`, and a merged group has several), so it sits at its earliest child. Bare rows must be re-interleaved with groups after the fact: `build_groups()` emits them in note order, but the bare dedup scope strands them after the last project until `order_rows()` puts them back. |
-| `-A` drops `**future**` | Via `parse_note(skip_future=True)`, which **only** `-A` passes. Single-day output still shows future buckets, unchanged. See finding 8. |
-| `-A` never reads the weekly note | Dailies only. That is why `tcat` has no `-W/--no-weekly`: unlike `tdiff`, plan and actual never share an aggregate, so there is nothing to switch off. |
+| Fixa, `future`, `promissum` | Parsed as ladder markers so they can't leak into a day, but **not exposed** — including under a week read. v1 is Actio days only. |
+| Dedup is **scoped**, not global | Each project's children collapse among themselves; bare top-level tasks collapse among themselves as one further scope. The scopes never merge, so a task under two projects keeps a row under each, and a bare occurrence never swallows a project's copy. Until July 2026 the bare scope was skipped entirely: `build_groups()` dropped `seq` for bare rows and the render loop `continue`d past `dedup()`, so top-level duplicates printed twice. Both halves of that fix have to stay — the `seq` is what lets `materialize()` pick a winner. |
+| Dedup spans the whole read | A task on Monday restated on Friday collapses to one row with Friday's status. Falls out of `materialize()`'s last-occurrence rule — but only because the notes are read in order and `seq` is **offset to keep climbing between them**. `parse_note()` restarts `seq` at 1 per call; drop the offset and "last in page order" silently becomes "last in whichever note". Under a bare `w##` the weekly note is read **first**, which is what makes every daily's status beat the plan's. |
+| A week drops day attribution | Deliberate. `tcat w34` answers *what is in this week*, not *when* — a by-day layout was considered and rejected. `weekday` is `null` in JSON for any week form. No labels, no by-day layout. |
+| A week drops `**future**` | Via `parse_note(skip_future=True)`, passed only for a daily note read *as part of a week*. A day read on its own still shows its future bucket — deferring something is part of that day. See finding 8. |
 | Colour is marker-only | The whole `[x]` marker, brackets included — tinting only the inner char was tried in July 2026 and reverted; it reads as half-lit. Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
 | Footer is always three fields | `contents · mode · file(s)`, in every mode including `--missio` (whose `contents` is the literal `text`). Projects fold into `contents` rather than taking a field. `--no-summary` drops the whole line, date included. |
-| The file field names what was read | So `-P` shows the weekly note, not the invoked day; `-A` names the week plus `(n/7 dailies)` because it never opens the weekly note. |
-| `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-P`/`--flat`/`--order`/`-S`/`--routines`/`-A` are ignored. |
+| The file field names what was read | So `-W` on a date shows the weekly note, not the invoked day; a week names the label plus `(n/7 dailies)`, and `, weekly` too when the weekly note was one of the sources. |
+| `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-S`/`-I`/`--routines` are ignored — but `-D`/`-W` are **rejected**, since --missio already reads the weekly note and they would have nothing to narrow. |
 | `--missio` JSON is minimal | Exactly `{"week", "missio"}` — deliberately *not* the task envelope. `missio` is `null` for missing note, missing heading, or empty body. |
-
-### The plan flag is `-P`, not `-w`
-
-Deliberate, and not an oversight to be "corrected" toward `tdiff`. In `tdiff`,
-`-W/--no-weekly` means *exclude* the weekly file; in `tcat` the same letter would mean
-*use* it — the same object with opposite polarity, across two tools run side by side.
-`-P/--plan` collides with neither and matches how the weekly Actio allocation is actually
-described. Don't rename it to `-w` or `-W`.
-
-**The whole-week flag is `-A`, not `-W`, for the same reason.** `-W` reads as the obvious
-letter in isolation, but it already means *exclude the weekly note* in `tdiff` — the exact
-opposite polarity, on two tools run side by side. `-A/--all-week` collides with nothing.
-
-**`-w` and `w##`, however, are copied from `tdiff` exactly.** Week *selection* has no
-polarity problem, so the two tools should take identical arguments: `w30` / `w2026-W30` as
-the positional, `-w N` as a relative offset. `resolve_week_label`, `_week_label_to_sunday`
-and both week regexes are vendored verbatim and covered by `tools/check-core-sync.sh` —
-as is `resolve_date`, so day selection matches too.
-Note `-w` is an **offset**, not a week number — that is `tdiff`'s meaning and it stays.
-One divergence: `tdiff -w 0` excludes the anchor from its own week because it is diffing;
-`tcat` isn't, so `-w 0` is simply the anchor's week.
 
 ## Known gaps
 
@@ -324,7 +347,7 @@ since all three week functions are vendored. Two consequences worth keeping:
   to this fix, and arguably correct — noted so it isn't mistaken for a regression.
 
 Still outstanding: the Mensis exclusion is unverified (the vault holds no such note), the
-pre-`2026-W20` Sunday contamination under `-A` (finding 8), and there is no test suite.
+pre-`2026-W20` Sunday contamination under `w## -D` (finding 8), and there is no test suite.
 
 ## Style
 

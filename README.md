@@ -1,17 +1,16 @@
 # tcat
 
-Show one day's tasks from an Obsidian vault.
+Show what is in an Obsidian note: one day's tasks, or one week's.
 
-A single-file Python CLI that prints the tasks for a single day — either from that day's
-daily note (`<YYYY-MM-DD>`) or from the weekly planning note's (`YYYY-W##`) allocation
-for that weekday. Projects are grouped, duplicates are collapsed, and rows are sorted by
-status — or alphabetically, or in the note's own order, via `--order`.
-
-Two flags widen the lens to the week: `-A` merges the whole week's allocation into one
-list, and `--missio` prints the week's stated mission.
+A single-file Python CLI. **A date names a day, a `w##` names a week, and a week has two
+sources — its seven daily notes and its `YYYY-W##` weekly note — that `-D` / `-W` narrow
+to one.** Projects are grouped, duplicates are collapsed, and rows are ranked by status
+then name. `--missio` prints the week's stated mission instead of any tasks.
 
 Sibling to [`tdiff`](../tdiff). **`tdiff` answers *what changed*; `tcat` answers *what is
-there*.** `tcat` never compares two things — every comparison stays with `tdiff`.
+there*.** `tcat` never compares two things — every comparison stays with `tdiff`. The two
+share their date resolver, their note parser, their task-name normalisation and their
+status table, so a task has one name and one spelling whichever tool you ask.
 
 File lookups are folder-agnostic: notes resolve by filename anywhere in the vault (like
 an Obsidian wikilink), so `tcat` doesn't care which folder your notes live in. See
@@ -19,22 +18,43 @@ an Obsidian wikilink), so `tcat` doesn't care which folder your notes live in. S
 
 ## Breaking changes
 
-The output and configuration were reworked. If you used an earlier build:
+The flag surface was rebuilt around `tdiff`'s model, and the two tools now spell shared
+concepts the same way. If you used an earlier build:
 
-- **Config moved and changed shape.** The status table now lives at
+1. **`-P` is now `-W`.** `tdiff`'s `-W` used to mean *exclude* the weekly note, so `tcat`
+   avoided the letter; `tdiff` reversed that polarity, and `-W` now means *read only the
+   weekly note* in both tools. `tcat today -P` is `tcat today -W`.
+2. **`-A` is gone; name the week.** `tcat -A` is `tcat w0`, `tcat -A w30` is `tcat w30 -D`,
+   and `tcat -A -P w30` is `tcat w30 -W`. A bare `tcat w30` is new: both sources merged,
+   with the dailies winning any status conflict.
+3. **`-w N` is gone; weeks can be named relative.** `tcat -A -w -1` is `tcat w-1 -D`.
+   `w0`, `w-1` and `w+1` work in `tdiff` too.
+4. **`--flat` and `--order` are gone.** Output is always grouped and always ranked by
+   `[order].statuses` then name. `--flat`'s purpose — "the task set `tdiff` sees" — ended
+   when `tdiff` started grouping by project as well.
+5. **Task names keep their wikilink brackets.** `[[note|alias]]` now renders as
+   `[[note|alias]]`, not `alias`, matching `tdiff`. More importantly the ` – section`
+   suffix is stripped *before* links are touched, so a linked title containing a dash is
+   no longer truncated — that was losing text from 22 of 435 names in one test vault.
+6. **`--json` is flat.** `tasks` with nested `children` became `rows`, each naming its
+   `project`; `source` and `notes` became `mode` and `files`. Nothing consumed the old
+   shape — `tdiff -E`, its only reader, was deleted.
+7. **A missing `obsidian` binary is now fatal**, with a message and exit 2, instead of an
+   empty result and exit 0. `TCAT_ATTEMPTS` is gone and `TCAT_TIMEOUT` is now whole
+   seconds, defaulting to 1.
+
+Older, still true:
+
+- **Config moved and changed shape.** The status table lives at
   `~/.config/obsidian-tasks/statuses.toml` and uses grouped `[order]` / `[theme.*]` /
-  `[roles]` blocks instead of per-status `[statuses.X]` tables. `~/.config/tdiff/config.toml`
-  is **no longer read**. See [Configuration](#configuration).
+  `[roles]` blocks instead of per-status `[statuses.X]` tables.
+  `~/.config/tdiff/config.toml` is **no longer read**. See [Configuration](#configuration).
 - **There are no built-in status ranks.** Order comes from config or not at all; with no
   config `tcat` runs unranked and uncoloured and says so once on stderr.
 - **`-v` is gone**, along with the per-reason explanations of an empty result. Empty output
-  is always `nothing to show`. The `reason` key is gone from `--json` too.
-- **The header moved to the bottom.** Output now starts with the first task; context lives
-  in a single footer line. `--no-summary` suppresses that whole line, date included.
-- **`-f` is gone; the flag is `--flat`.** It also no longer implies an order — it used to
-  sort alphabetically on its own, which had quietly drifted from the grouped view. Order
-  is now `--order`, and `--flat` defaults to the same `status` order as everything else.
-  `--flat --order alpha` is the old behaviour.
+  is always `nothing to show`.
+- **The header moved to the bottom.** Output starts with the first task; context lives in a
+  single footer line. `--no-summary` suppresses that whole line, date included.
 
 ## Requirements
 
@@ -54,43 +74,47 @@ ln -s ~/Projects/tcat/tcat ~/.local/bin/tcat
 ## Usage
 
 ```
-tcat [date] [options]
+tcat [date|w##] [options]
 ```
+
+**A date names a day, a `w##` names a week, and a week has two sources you can narrow to.**
+The positional picks the scope; `-D`/`-W` pick the source.
 
 ```sh
 tcat                    # today's daily note
 tcat yesterday          # yesterday's daily note
 tcat tuesday            # the most recent Tuesday
-tcat -P tuesday         # what the weekly plan allocated to that Tuesday
-tcat -P tomorrow        # tomorrow's allocation (no daily note exists yet)
-tcat 2026-03-04 --flat  # one list, no project grouping
-tcat --order page       # in the order the note wrote them
+tcat tuesday -W         # what the weekly plan allocated to that Tuesday
+tcat tomorrow -W        # tomorrow's allocation (no daily note exists yet)
 tcat -S x               # only completed tasks
-tcat -A                 # everything actually done across this whole week
-tcat -A -P              # everything the plan allocated for it
-tcat -A w30             # week 30, by number
-tcat -A -w -1           # last week
+
+tcat w30                # week 30: its weekly note and its seven dailies, merged
+tcat w30 -D             # ...the dailies only — what actually happened
+tcat w30 -W             # ...the weekly note only — the plan
+tcat w0                 # this week
+tcat w-1 -D             # last week, dailies only
 tcat --missio           # this week's mission, verbatim
 ```
 
-### Dates
+### Dates and weeks
 
 | Form | Meaning |
 | --- | --- |
 | `YYYY-MM-DD` | that date |
 | `today`, `0` | today (the default) |
 | `yesterday` | yesterday |
-| `tomorrow` | tomorrow (needs `-P`) |
+| `tomorrow` | tomorrow (needs `-W`) |
 | `-N` / `+N` | N days before / after today |
 | `monday`…`sunday`, `mon`…`sun` | **the most recent occurrence at or before today** |
-| `w##`, `w2026-W##` | a whole week, not a day — needs `-A` or `--missio` |
+| `w##`, `w2026-W##` | that week |
+| `w0`, `w-1`, `w+1` | this week, last week, next week |
 
 Weekday names resolve *backwards* on purpose. A future weekday has no tasks recorded
 yet, so resolving forwards would always come back empty. On a Monday, `tuesday` means
 last Tuesday and `monday` means today.
 
-Asking for a future date without `-P` is an error: the daily note won't exist. Use `-P`
-to read the plan's allocation for a day that hasn't happened.
+Asking for a future date without `-W` is an error: the daily note won't exist. A `w##` or
+`-W` may look forward freely — the weekly note is often written before the week starts.
 
 Weeks run Sunday to Saturday, and **a week is named for the year it ends in** — week 1 is
 the week containing Jan 1, so Sun 2026-12-27 → Sat 2027-01-02 is `w2027-W01`, matching the
@@ -98,26 +122,26 @@ vault's filenames. Naming a week the calendar can't produce (`w2026-W53`, which 
 2027-W01) is rejected with the correct label, rather than silently reading a note that
 doesn't exist.
 
-`w30` names week 30 of the current year; `w2026-W30` is explicit. Both come from `tdiff`,
-verbatim, so the two tools take the same week arguments. A week isn't a day, so a bare
-`tcat w30` is an error — say what you want for it (`-A`, `-A -P` or `--missio`). The
-relative form is `-w N`: `-w -1` is last week, `-w 0` the date's own week.
+Every one of these forms comes from `tdiff`, verbatim — the resolver is shared code, so the
+two tools always take the same arguments.
 
 ### Options
 
 | Flag | Effect |
 | --- | --- |
-| `-P`, `--plan` | read the weekly note's Actio allocation for that day (the plan) instead of the daily note |
-| `-A`, `--all-week` | the whole week as one deduplicated list: the week's seven daily notes, or with `-P` the weekly note's Actio plan. The date picks the week; its weekday is ignored |
-| `-w N`, `--week-offset N` | select the week N weeks away (`-1` = last week). Only applies to `-A` and `--missio` |
+| `-D`, `--dailies` | read only daily notes: on a `w##`, the week's seven; on a date, the daily note, which is already the default |
+| `-W`, `--weekly` | read only the weekly note's `### *Actio*`: on a date, that weekday's allocation; on a `w##`, the whole week's plan |
 | `--missio` | print the weekly note's `### *Missio*` section verbatim instead of any tasks |
-| `--flat` | drop project grouping, promote children to top level. Says nothing about order — that is `--order` |
-| `--order MODE` | `status` (default) ranks by `[order].statuses` then alphabetically; `alpha` is alphabetical only; `page` is the order the note wrote them in |
-| `-S SET` | show only these status chars; prefix `^` to invert. Overrides hidden statuses |
+| `-S SET`, `--status SET` | show only these status chars; prefix `^` to invert. Overrides hidden statuses |
 | `-I`, `--ignore` | hide settled tasks — the statuses in `[roles].settled` — leaving only what is still open |
 | `--routines` | include `#routine` tasks (excluded by default) |
 | `--json` | machine-readable output |
-| `--no-color`, `--no-summary`, `--config PATH` | as in `tdiff` |
+| `--no-color`, `--no-summary` | as in `tdiff` |
+| `--config PATH` | additional (merging) config layer, applied last |
+
+`-D` and `-W` are mutually exclusive: naming neither reads both sources, so naming both
+would be a second spelling of the default. They are `tdiff`'s letters with `tdiff`'s
+polarity — `-W` means *read only the weekly note* in both tools.
 
 `-S -` looks like a flag to argparse; use `-S=-` or fold it into a set (`-S 'x-'`).
 
@@ -150,14 +174,15 @@ Tasks start on the first line. Everything contextual sits in one dim footer, alw
 | invocation | footer |
 | --- | --- |
 | `tcat 2026-03-04` | `12 tasks, 2 projects  ·  daily  ·  2026-03-04` |
-| `tcat -P` | `5 tasks  ·  plan  ·  2026-W10` |
-| `tcat -A` | `38 tasks  ·  all  ·  2026-W10 (6/7 dailies)` |
-| `tcat -A -P` | `31 tasks  ·  all plan  ·  2026-W10` |
+| `tcat 2026-03-04 -W` | `5 tasks  ·  plan  ·  2026-W10` |
+| `tcat w10` | `44 tasks  ·  week  ·  2026-W10 (6/7 dailies, weekly)` |
+| `tcat w10 -D` | `38 tasks  ·  week dailies  ·  2026-W10 (6/7 dailies)` |
+| `tcat w10 -W` | `31 tasks  ·  week plan  ·  2026-W10` |
 | `tcat --missio` | `text  ·  missio  ·  2026-W10` |
 
-The file field names **what was actually read**, which is why `-P` shows the weekly note
-rather than the day you asked about, and why `-A` — which never opens the weekly note —
-names the week and states its coverage.
+The file field names **what was actually read**, which is why `-W` shows the weekly note
+rather than the day you asked about, and why a week states its coverage — how many of the
+seven dailies were on disk, and whether the weekly note was among the sources.
 
 That note wrote `site migration` under four different blocks; the four children above
 are all of them, collapsed into one group.
@@ -179,35 +204,24 @@ top-level tasks collapse among themselves, but never into one another. A task li
 two projects therefore keeps a row under each — the project header is context worth
 seeing — and a top-level occurrence never swallows a project's copy.
 
-**Links are cleaned.** `[[note|alias]]` → `alias`, `[[folder/note]]` → `note`,
-`[text](url)` → `text`.
-
-`--flat` undoes the first two levels of that: no project headers, children promoted. This
-is the task set `tdiff` sees for the same date. Having no projects, it also has no scopes,
-so it collapses across all of them — which is why `--flat` can show *fewer* rows than the
-grouped view of the same day. That is the two views answering different questions, not a
-discrepancy.
+**Links keep their brackets.** A wikilink loses only its folder path
+(`[[folder/note|alias]]` → `[[note|alias]]`); a markdown link reduces to its display text
+(`[text](url)` → `text`). A trailing ` – section` suffix is dropped **before** links are
+touched, so a linked title containing a dash survives intact — `tcat` used to reduce the
+link first and cut the name at the dash, which is fixed and matches `tdiff` exactly.
 
 ### Order
 
-Structure and order are separate flags. `--flat` says whether project headers are there;
-`--order` says how rows are arranged, and applies to the grouped and flat views alike —
-top level and project children both.
+Rows are ranked by `[order].statuses`, then alphabetically within a rank — at every level,
+top-level rows and project children alike. There is no flag: `--flat` and `--order` both
+existed and both were removed, because neither had a second setting worth keeping.
+`--flat`'s stated purpose was "the task set `tdiff` sees", which stopped being true once
+`tdiff` started grouping by project too; `--order alpha` was indistinguishable from the
+default unless a config existed, and `--order page` forced a page position through the
+whole pipeline to serve only itself.
 
-| `--order` | arrangement |
-| --- | --- |
-| `status` (default) | rank from `[order].statuses`, then alphabetically within a rank |
-| `alpha` | alphabetically, ignoring status |
-| `page` | the order the note wrote them in |
-
-With no config there are no ranks, so everything is `UNRANKED` and `status` degrades to
-`alpha` on its own.
-
-`page` is the order of the *deduplicated* list, not a transcript of the note. A task
-raised once and restated later collapses to a single row that sits at the **first**
-mention while showing the **last** status. Under `-A` that makes the week read
-chronologically — the seven dailies are parsed in date order — which is the one place
-`tcat` will show you when something happened; the default orders deliberately do not.
+With no config there are no ranks, so everything is `UNRANKED` and the order is
+alphabetical.
 
 ### Colour
 
@@ -226,44 +240,54 @@ is the right answer for the most common ones.
 
 ### The whole week
 
-`-A` widens the lens from a day to a week. It keeps `tcat`'s existing polarity — a bare
-date is what actually happened, `-P` is what was planned — so there are two of them:
+A `w##` widens the lens from a day to a week. A week has two sources, and `-D`/`-W` pick
+which to read; naming neither reads both.
 
 | | reads | answers |
 | --- | --- | --- |
-| `tcat -A` | the week's seven **daily notes** | what did I actually do this week |
-| `tcat -A -P` | the weekly note's **Actio** | what was this week supposed to be |
+| `tcat w30 -D` | the week's seven **daily notes** | what did I actually do |
+| `tcat w30 -W` | the weekly note's **Actio** | what was the week supposed to be |
+| `tcat w30` | **both**, merged and deduped | everything this week involved |
 
 Same grouping, same dedup, same sorting as a single day. Only the source widens, and the
-footer names the week. `--order page` is the one place the week reads chronologically —
-the dailies are parsed in date order — and there are still no day labels:
+footer names the week.
 
 ```
-$ tcat -A 2026-03-04
+$ tcat w10 -D
   [u] site migration
       [#] confirm dns cutover window
       [x] audit redirect map
   [!] renew domain
   [ ] tidy downloads folder
 
-  4 tasks, 1 project  ·  all  ·  2026-W10 (6/7 dailies)
+  4 tasks, 1 project  ·  week dailies  ·  2026-W10 (6/7 dailies)
 ```
 
 The `6/7 dailies` is the point: days without a note are skipped silently, so a thin week
 is usually a week you didn't write up rather than a week you didn't work. A week in
 progress shows `2/7`.
 
-Day attribution is dropped by design — this answers *what happened this week*, not *when*.
-Dedup therefore spans the week: a task written on Monday and restated on Friday appears
-once, carrying **Friday's** status. Under `-A -P`, `promissum` and `future` stay hidden as
-elsewhere; under plain `-A`, tasks in a daily note's `**future**` bucket are dropped too —
-they are explicitly deferred work, and folding seven days' worth of them into the list
-would drown it. Single-day output still shows them.
+**In the merged form, the dailies win.** The weekly note is read first and the seven
+dailies after it, so when a task appears in both, the row carries the status the *daily*
+gave it — the plan says what was intended, the daily says what became of it. This is the
+same precedence `tdiff` gets by ranking the weekly note below every daily.
 
-The date argument selects the *week*; its weekday is ignored, so `tcat -A tuesday` and
-`tcat -A` are identical whenever both land in the same week, and `tcat -A w30` names one
-outright. In `--json`, `weekday` is `null` for a week payload and `notes` lists exactly
-which notes were read.
+Day attribution is dropped by design — a week answers *what is in this week*, not *when*.
+Dedup therefore spans the whole read: a task written on Monday and restated on Friday
+appears once, carrying **Friday's** status. `promissum` stays hidden throughout. `future`
+is dropped from a daily note read *as part of* a week — deferred work would otherwise
+drown seven days of real work, and a pre-split Sunday's bucket holds a whole week of it —
+but a day read on its own still shows its future bucket, because deferring something is
+part of that day.
+
+`w## -W` reads the tasks listed under `### *Actio*` but never allocated to a `**weekday**`
+marker, as well as the allocated ones. On a week you are still drafting that is usually all
+of them, and without it the plan would read as empty against a section holding dozens of
+tasks. The single-day form (`tcat tuesday -W`) asks the narrower question — what is
+allocated to *that day* — and so reads the marker alone.
+
+In `--json`, `weekday` is `null` for a week payload and `files` lists exactly which notes
+were read.
 
 ### The week's mission
 
@@ -299,7 +323,7 @@ an empty body. Exit status is 0 in every case.
 
 ## Status order
 
-Rows sort by status rank first, then alphabetically — that is `--order status`, the
+Rows sort by status rank first, then alphabetically — the only order there is, the
 default; see [Order](#order) for the other two. **There are no built-in ranks** — the
 order comes from `[order].statuses`, a single ordered list where rank *is* position. Ties
 cannot be expressed and reordering means moving a string.
@@ -380,7 +404,7 @@ Lists replace wholesale rather than merging element-wise: naming a partial
 statuses = ["u", "!", "i", "*", ">", "=", "o", "p", " ", "/", "#", "~", "&", "»", "«", "-", "x"]
 
 [roles]
-project  = ["p", "i", "u"]   # opens a project group; dropped entirely by --flat
+project  = ["p", "i", "u"]   # opens a project group; never a row of its own
 hide     = ["&", "»", "«"]   # never shown; filtered after dedup
 settled  = ["x", "-", "&", "»", "«"]   # hidden by -I; shared with tdiff
 full_row = ["x", "-"]        # colour the whole line, not just the [x] marker
@@ -405,7 +429,7 @@ background, so an env var settles it rather than a query that would need raw-tty
 
 ## How the weekly note is read
 
-`obsidian tasks` cannot drive `-P`, for two reasons found while building this:
+`obsidian tasks` cannot drive `-W`, for two reasons found while building this:
 
 - It carries **no section context**, so a task can't be attributed to a weekday.
 - It **silently skips fenced code blocks** — and the weekly note's entire `### *Fixa*`
@@ -439,7 +463,7 @@ An earlier build explained *which* of those it was, behind `-v`. Both are gone.
 
 Three things are deliberately unfinished. None affect day-to-day use today.
 
-**0. `-A` over a week before `2026-W20` over-counts.** Weekly notes only start at W20;
+**0. A week read before `2026-W20` over-counts.** Weekly notes only start at W20;
 before that the whole weekly structure — including the coming week's day-by-day plan —
 lived inside the Sunday daily note, wrapped in a fence. `tcat` ignores fences on purpose
 (see *How the weekly note is read*), so aggregating such a week folds that Sunday's plan
@@ -454,8 +478,9 @@ Re-run that check once such a note exists.
 
 **2. No test suite.** Testing is manual via CLI invocation, matching `tdiff`. The checks
 worth automating first are the ones that actually caught bugs during the build: parse
-counts against `obsidian tasks` for every weekly note, and `--flat` against `tdiff`'s task
-set for the same date.
+counts against `obsidian tasks` for every weekly note, and `tcat --json` row names against
+`tdiff --json` row names for the same date — the two now share the parser and the name
+normalisation, so any disagreement is a real regression.
 
 Separately, **Fixa, `future` and `promissum` are parsed but not exposed.** That is a
 scope decision rather than a gap — v1 reads the live Actio day allocation only — but the
@@ -471,8 +496,19 @@ tools/check-core-sync.sh [path-to-tdiff-repo]
 ```
 
 It diffs each vendored function and constant against `tdiff` at the pinned commit
-(`123b5b1`) and exits non-zero on any difference. `materialize` is deliberately excluded:
-`tcat` reduces a cluster by page position, `tdiff` by `priority`.
+(`92f195c`) and exits non-zero on any difference. The guarded surface is **15 functions
+and 18 constants**: the date and week resolvers, the note parser and its regexes, task-name
+normalisation, the clustering predicate, and `display_rank`. Between them they cover every
+question the two tools must answer identically — which note to open, what counts as a task,
+what a task is called, when two tasks are the same one, and how statuses rank.
+
+A handful of things are deliberately excluded, and the script lists them with reasons.
+`materialize` is the important one: `tcat` reduces a cluster by page position, `tdiff` by
+`[dedup].priority`. The rest are either tool-named (anything printing `tcat:` or `tdiff:`)
+or genuinely tcat-shaped (`build_groups`, `dedup`, `order_rows`).
+
+`statuses.example.toml` is byte-identical in both repos and has no sync check, because it
+isn't code. `diff` it against `../tdiff/statuses.example.toml` before committing a change.
 
 ## License
 
