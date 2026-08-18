@@ -53,6 +53,7 @@ FUNCS=(
   _xdg_base
   notice
   restore
+  display_rank
 )
 
 extract() {

@@ -4,12 +4,13 @@
 Sibling to `tdiff`. `tdiff` answers *what changed*; `tcat` answers *what is there*.
 It never compares two sources — every comparison stays with `tdiff`.
 """
-import sys, re, os, subprocess, argparse, json, tomllib
+import sys, re, os, time, threading, subprocess, argparse, json, tomllib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
 # ── Vendored task core ────────────────────────────────────────────────────────
-# Synced from brunnorpdias/tdiff@123b5b1 ("share the status table with tcat, add -E").
+# Synced from brunnorpdias/tdiff@92f195c ("name weeks relative to this one").
 # Keep this block byte-identical to tdiff's where marked; tools/check-core-sync.sh
 # verifies it. Divergences are called out inline.
 
@@ -177,7 +178,7 @@ def materialize(clusters):
 # describes the user's vault, not this tool, and inventing a fallback table is how
 # the old build ended up sorting by ranks nobody had chosen. With no config at all
 # tcat still runs — everything unranked and uncoloured — and says so once on stderr.
-STATUS_ORDER     = {}     # char -> rank, derived from [order].statuses position
+DISPLAY_ORDER     = {}     # char -> rank, derived from [order].statuses position
 THEMES           = {}     # theme name -> {char: '#rrggbb'}
 FULL_ROW         = set()  # statuses whose whole row takes the colour, not just [x]
 HIDDEN_STATUSES  = set()
@@ -189,6 +190,15 @@ CONFIG_FOUND  = False
 
 # Anything absent from [order].statuses sorts last, in a block, alphabetically.
 UNRANKED = 10 ** 6
+
+def display_rank(ch):
+    """Sort rank for a status char, from [order].statuses.
+
+    A status the table does not list ranks last as a block — alphabetical within it,
+    since the name is the next sort key — which is what the shipped statuses.toml
+    promises and what tcat does with the same list. report_unlisted() names them.
+    """
+    return DISPLAY_ORDER.get(ch, UNRANKED)
 
 # Config complaints are advisory, never fatal, and never belong in a pipe: they are
 # collected here and flushed to stderr at the end, unless --json or --no-summary
@@ -243,7 +253,7 @@ def load_config(override, error):
     (if uncoloured) state, reported once by notice(). Only unparseable TOML is an
     error.
     """
-    global STATUS_ORDER, THEMES, FULL_ROW, HIDDEN_STATUSES, PROJECT_STATUSES
+    global DISPLAY_ORDER, THEMES, FULL_ROW, HIDDEN_STATUSES, PROJECT_STATUSES
     global SETTLED_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
 
     merged = {}
@@ -261,7 +271,7 @@ def load_config(override, error):
 
     # Rank is list position, so ties cannot be expressed and reordering is a move.
     statuses = merged.get('order', {}).get('statuses', [])
-    STATUS_ORDER = {c: i for i, c in enumerate(statuses)}
+    DISPLAY_ORDER = {c: i for i, c in enumerate(statuses)}
 
     THEMES = {name: dict(table)
               for name, table in merged.get('theme', {}).items()
@@ -280,72 +290,172 @@ def load_config(override, error):
 
 # ── Note reading ──────────────────────────────────────────────────────────────
 
-_NOT_FOUND_RE = re.compile(r'^Error: File ".*" not found\.$')
+class ObsidianError(Exception):
+    """The obsidian CLI could not be run, or reported an error we can't interpret.
+    `retry` is False for permanent failures (no binary), True for ones observed to be
+    transient. `stalled` marks the timeout case, which is worth telling the user about
+    because it's the only failure they feel as a pause."""
+    def __init__(self, msg, retry=True, stalled=False):
+        super().__init__(msg)
+        self.retry = retry
+        self.stalled = stalled
 
-# -A reads seven notes where every other mode reads one. Each call is mostly spent
-# waiting on the obsidian app, so overlapping them is most of the win; 4 workers is
-# plenty, because the app is a single process on the other end. TCAT_WORKERS=1
-# forces serial reads.
-def _env_num(name, default, cast):
+# A note that simply doesn't exist is normal (a day with no note, a week with no
+# planning note) — obsidian reports it on stdout with exit status 0.
+_MISSING_FILE_RE = re.compile(r'^Error: File "[^"]*" not found\.$')
+_NEW_PREFIX_RE   = re.compile(r'^\(new\)\s*', re.IGNORECASE)
+
+def _env_int(name, default):
     try:
-        return cast(os.environ[name])
+        return max(1, int(os.environ[name]))
     except (KeyError, ValueError):
         return default
 
-FETCH_WORKERS = max(1, _env_num('TCAT_WORKERS', 4, int))
+# Concurrency is a small win (4 and 8 workers measure the same), so keep it low —
+# the obsidian CLI talks to a single running app. TCAT_WORKERS=1 forces serial reads.
+FETCH_WORKERS = _env_int('TCAT_WORKERS', 4)
 
-# The obsidian CLI occasionally wedges on a read that normally takes ~10ms —
-# observed in this vault, and the reason tdiff caps and retries its calls too. A
-# single-note mode would just look slow; -A makes seven calls, so the odds of
-# meeting a stalled one are seven times higher. Cap, retry, move on.
-FETCH_TIMEOUT  = _env_num('TCAT_TIMEOUT', 5.0, float)
-FETCH_ATTEMPTS = max(1, _env_num('TCAT_ATTEMPTS', 3, int))
+# Roughly one obsidian call in a few hundred wedges and never returns, at the same
+# rate whether we read serially or concurrently. The wedge is per-invocation — the app
+# keeps answering everything else — so a short deadline plus a fresh call is the cure.
+# A healthy call takes ~10ms (20ms worst of 320 measured), so 1s is ~100x headroom and
+# keeps a stall inside the second this tool should always finish in. A merely slow call
+# is not lost by a tight deadline: the retry catches it.
+OBSIDIAN_TIMEOUT  = _env_int('TCAT_TIMEOUT', 1)   # seconds per call
+OBSIDIAN_ATTEMPTS = 3
+SLOW_NOTICE_AFTER = 2.5     # seconds before telling the user we're waiting, not hung
+DEBUG = bool(os.environ.get('TCAT_DEBUG'))
 
 _lines_cache = {}
 
-def _read_uncached(name):
-    # stdin=DEVNULL matters: the obsidian CLI drains stdin, so without it `tcat`
-    # silently eats whatever is being piped into the script that called it.
-    for attempt in range(FETCH_ATTEMPTS):
+def die(msg):
+    """Report a fatal error and leave immediately. os._exit() because a wedged
+    obsidian call can leave a pool thread blocked, and a normal exit would hang
+    joining it."""
+    sys.stdout.flush()
+    sys.stderr.write(f"tcat: {msg}\n")
+    sys.stderr.flush()
+    os._exit(2)
+
+def _on_uncaught(exc_type, exc, tb):
+    """Ctrl-C should leave at once — without a traceback, and without waiting on
+    reader threads that may be stuck on a slow obsidian call."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.stdout.flush()
+        sys.stderr.write('\ntcat: interrupted\n')
+        sys.stderr.flush()
+        os._exit(130)
+    sys.__excepthook__(exc_type, exc, tb)
+
+sys.excepthook = _on_uncaught
+
+def _run_obsidian(file_path):
+    """Return the raw markdown lines of one vault file, retrying a failure that might
+    be transient. Raises ObsidianError once the attempts are spent."""
+    for attempt in range(1, OBSIDIAN_ATTEMPTS + 1):
         try:
-            r = subprocess.run(['obsidian', 'read', f'file={name}'],
-                               capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, timeout=FETCH_TIMEOUT)
-            break
-        except subprocess.TimeoutExpired:
-            if attempt == FETCH_ATTEMPTS - 1:
-                print(f"tcat: obsidian did not answer for '{name}' after "
-                      f"{FETCH_ATTEMPTS} attempts; skipping it", file=sys.stderr)
-                return None
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    lines = r.stdout.splitlines()
-    if _NOT_FOUND_RE.match(lines[0].strip()):
-        return None
+            return _obsidian_once(file_path)
+        except ObsidianError as e:
+            if not e.retry or attempt == OBSIDIAN_ATTEMPTS:
+                raise
+            if e.stalled:
+                sys.stderr.write(f"tcat: obsidian stalled on {file_path}, retrying\n")
+
+def _obsidian_once(file_path):
+    """One `obsidian read` call. Raises ObsidianError if the CLI is missing or its
+    output isn't something we can trust.
+
+    `read` rather than `tasks`: the flat task list `tasks` returns has already
+    thrown away the headings, and the ladder markers under ### *Actio* are the only
+    thing that says which of a weekly note's tasks are the week's plan. tcat has
+    always read raw markdown for that reason; this is the seam where the two tools
+    stopped disagreeing about what a note contains."""
+    argv = ['obsidian', 'read', f'file={file_path}']
+    started = time.monotonic()
+    try:
+        # stdin is closed: this is never an interactive call, and a CLI that decided
+        # to read from the terminal would block every reader thread behind it.
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=OBSIDIAN_TIMEOUT)
+    except FileNotFoundError:
+        raise ObsidianError(
+            "the 'obsidian' CLI was not found on PATH — tcat reads the vault through it",
+            retry=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ObsidianError(
+            f"'obsidian read file={file_path}' produced nothing within "
+            f"{OBSIDIAN_TIMEOUT}s on {OBSIDIAN_ATTEMPTS} attempts — is Obsidian running "
+            f"with the vault open? (TCAT_TIMEOUT=N raises the limit)",
+            stalled=True,
+        )
+    except OSError as e:
+        raise ObsidianError(f"could not run 'obsidian': {e}")
+
+    if DEBUG:
+        sys.stderr.write(f"tcat: {time.monotonic() - started:6.3f}s  {file_path}\n")
+
+    out, err = result.stdout, result.stderr.strip()
+    if result.returncode != 0:
+        detail = err or out.strip()
+        first = detail.splitlines()[0] if detail else '(no output)'
+        raise ObsidianError(f"'obsidian read file={file_path}' exited {result.returncode}: {first}")
+
+    lines = out.splitlines()
+    if not lines:
+        # An empty note is a legitimately empty side, the same as a missing one.
+        return []
+    # Only the *first* line can be an error report. Scanning them all was safe while
+    # this read a task list; on raw markdown a note that happens to open a line with
+    # "Error:" would be misread as a failed read.
+    first = lines[0].strip()
+    if _MISSING_FILE_RE.match(first):
+        return []
+    if first.startswith('Error:'):
+        raise ObsidianError(f"obsidian could not read {file_path!r}: {first}")
+    if not out.strip() and err:
+        raise ObsidianError(f"obsidian returned nothing for {file_path!r}: {err.splitlines()[0]}")
     return lines
 
-def read_note(name):
-    """Return a note's lines, or None if it doesn't resolve. Folder-agnostic:
-    `obsidian read file=` resolves a bare filename anywhere in the vault.
+def obsidian_lines(file_path):
+    """Memoized markdown lines for one vault file."""
+    if file_path not in _lines_cache:
+        try:
+            _lines_cache[file_path] = _run_obsidian(file_path)
+        except ObsidianError as e:
+            die(str(e))
+    return _lines_cache[file_path]
 
-    `obsidian` exits 0 on a missing file and prints the error to stdout when it
-    isn't attached to a TTY, so the message has to be matched explicitly."""
-    if name not in _lines_cache:
-        _lines_cache[name] = _read_uncached(name)
-    return _lines_cache[name]
+def prefetch(paths):
+    """Warm the line cache for several vault files at once. Each obsidian call is
+    mostly waiting on the app, so overlapping them is a win for week modes.
 
-def prefetch(names):
-    """Warm the cache for several notes at once. Single-note modes never call this,
-    so they keep exactly the cost they had before."""
-    todo = [n for n in dict.fromkeys(names) if n not in _lines_cache]
-    if FETCH_WORKERS < 2 or len(todo) < 2:
-        for n in todo:
-            read_note(n)
+    `read` returns a whole note where `tasks` returned a handful of lines, so each
+    payload is larger — but the call count is unchanged, and the wait was always
+    the round trip rather than the bytes."""
+    todo = [p for p in dict.fromkeys(paths) if p not in _lines_cache]
+    if not todo:
         return
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
-        for n, lines in zip(todo, ex.map(_read_uncached, todo)):
-            _lines_cache[n] = lines
+    # Named slow_timer, not notice: notice() is the deferred-message function, and a
+    # local of that name here would shadow it for the whole body.
+    slow_timer = threading.Timer(SLOW_NOTICE_AFTER, sys.stderr.write,
+                                 (f"tcat: waiting on obsidian ({len(todo)} files)…\n",))
+    slow_timer.daemon = True
+    slow_timer.start()
+    try:
+        if FETCH_WORKERS < 2 or len(todo) < 2:
+            for p in todo:
+                obsidian_lines(p)
+            return
+        # Both branches go through obsidian_lines() so the vault read has exactly one
+        # seam. Submitting _run_obsidian directly used to leave the memo wrapper
+        # bypassed on the concurrent path — a second entry point that anything hooking
+        # the read would silently miss.
+        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
+            for p in todo:
+                ex.submit(obsidian_lines, p)
+    finally:
+        slow_timer.cancel()
 
 TASK_RE = re.compile(r'^(\s*)- (\[.\]) (.+)$')
 H2_RE   = re.compile(r'^##\s+\*(\w+)\*')
@@ -521,7 +631,7 @@ def dedup(items):
     return [(tasks[n], n, first[n]) for n in order]
 
 def sort_key(status, name):
-    return (STATUS_ORDER.get(status, UNRANKED), name.lower())
+    return (display_rank(status), name.lower())
 
 def order_rows(rows):
     """Sort rows in place per --order. Every level of every view goes through here —
@@ -820,15 +930,15 @@ def footer(contents, mode, note_field):
     return f'  {DIM}' + '  ·  '.join([contents, mode, note_field]) + RESET
 
 def flush_notices():
-    """Config complaints, on stderr, at the end.
-
-    --json and --no-summary both mean "output with nothing around it", so they
-    silence these; stderr keeps them out of a pipe either way.
-    """
-    if args.json or args.no_summary:
-        return
     for m in NOTICES:
         print(f'tcat: {m}', file=sys.stderr)
+
+def finish(code=0):
+    """Exit, flushing notices first. --json and --no-summary both mean 'output with
+    nothing around it', so neither gets them."""
+    if not (args.json or args.no_summary):
+        flush_notices()
+    sys.exit(code)
 
 def report_unlisted(statuses):
     """Flag statuses that appeared in a note but are absent from [order].statuses.
@@ -838,7 +948,7 @@ def report_unlisted(statuses):
     """
     if not CONFIG_FOUND:
         return
-    missing = sorted(s for s in statuses if s not in STATUS_ORDER)
+    missing = sorted(s for s in statuses if s not in DISPLAY_ORDER)
     if missing:
         shown = ' '.join(f'[{s}]' for s in missing)
         notice(f'not in [order].statuses, so shown last and uncoloured: {shown}')
@@ -859,14 +969,16 @@ def daily_name(d):
 # Standalone: the week's mission is prose, not tasks, so this branch reads the
 # weekly note, prints, and exits before any of the task machinery is consulted.
 if args.missio:
-    lines = read_note(WEEKLY_NAME)
-    body = extract_section(lines, 'missio') if lines is not None else None
+    lines = obsidian_lines(WEEKLY_NAME)
+    # obsidian_lines returns [] for a missing note, and extract_section returns None
+    # for a note with no such heading — so the missing-file guard is redundant.
+    body = extract_section(lines, 'missio')
     body = body or None      # '' (heading present, nothing written) reads as absent
 
     if args.json:
         print(json.dumps({'week': week_label, 'missio': body},
                          ensure_ascii=False, indent=2))
-        sys.exit(0)
+        finish()
 
     if body:
         for line in body.split('\n'):
@@ -878,8 +990,7 @@ if args.missio:
         # the shape never changes: contents · mode · file.
         print()
         print(footer('text', 'missio', week_label))
-    flush_notices()
-    sys.exit(0)
+    finish()
 
 records = []
 notes_read = []
@@ -896,8 +1007,8 @@ if args.all_week and not args.plan:
     prefetch(week_names)
     seq0 = 0
     for name in week_names:
-        lines = read_note(name)
-        if lines is None:
+        lines = obsidian_lines(name)
+        if not lines:
             continue
         notes_read.append(name)
         # Page order across the seven notes is what makes dedup pick the latest
@@ -922,8 +1033,8 @@ else:
         source = 'daily'
         mode, note_field = 'daily', target
 
-    lines = read_note(note_name)
-    if lines is not None:
+    lines = obsidian_lines(note_name)
+    if lines:
         notes_read.append(note_name)
         if args.plan or args.all_week:
             records = list(parse_note(lines, region='actio',
@@ -987,7 +1098,7 @@ if args.json:
             for s, n, k, _ in rows
         ],
     }, ensure_ascii=False, indent=2))
-    sys.exit(0)
+    finish()
 
 leaves = 0
 seen_statuses = set()
@@ -1005,8 +1116,7 @@ for status, name, kids, _ in rows:
 if not rows:
     if not args.no_summary:
         print(f"  {DIM}nothing to show{RESET}")
-    flush_notices()
-    sys.exit(0)
+    finish()
 
 report_unlisted(seen_statuses)
 
@@ -1020,4 +1130,4 @@ if not args.no_summary:
     print()
     print(footer(contents, mode, note_field))
 
-flush_notices()
+finish()
