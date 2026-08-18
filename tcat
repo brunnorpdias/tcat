@@ -364,14 +364,26 @@ WEEK_DAYS = ('sunday', 'monday', 'tuesday', 'wednesday',
 LADDER = ('promissum',) + WEEK_DAYS + ('future',)
 
 def clean_text(s):
-    """Un-escape Obsidian bracket escapes, then reduce links to their display text."""
+    """Un-escape Obsidian's bracket escapes, drop a trailing ' – ...' section suffix,
+    then shorten wikilink paths and reduce markdown links to their display text.
+
+    **The order is the whole point, and it diverges from tcat.** `strip_section_suffix`
+    only skips a dash it can see is inside brackets, so it has to run while the
+    brackets are still there. tcat reduces links first, which leaves
+    `[[marc randolph on building netflix – tim ferriss (496)]]` looking like prose with
+    a section suffix and truncates it at the dash — 18 of 455 names in this vault, some
+    down to a third of their length. Un-escaping stays first either way, or `\\[\\[foo]]`
+    never registers as bracket depth at all.
+
+    Wikilinks keep their brackets (`normalize_wikilinks` only shortens the path), which
+    is the second divergence: tdiff has always displayed `complete [[2026-W28]]`, and a
+    name is a name whether or not the vault happened to link it. Markdown links do get
+    reduced — that part is new, and without it a name carries a full URL.
+    """
     s = s.replace('\\[', '[').replace('\\]', ']')
-    s = WIKILINK_RE.sub(
-        lambda m: (m.group(1).split('|', 1)[1] if '|' in m.group(1)
-                   else m.group(1).rsplit('/', 1)[-1]),
-        s)
-    s = MDLINK_RE.sub(lambda m: m.group(1), s)
-    return strip_section_suffix(s)
+    s = strip_section_suffix(s)
+    s = normalize_wikilinks(s)
+    return MDLINK_RE.sub(lambda m: m.group(1), s)
 
 def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
     """Yield (indent, status_char, name, seq) for tasks in a note.
