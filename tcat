@@ -4,578 +4,24 @@
 Sibling to `tdiff`. `tdiff` answers *what changed*; `tcat` answers *what is there*.
 It never compares two sources — every comparison stays with `tdiff`.
 """
-import sys, re, os, time, threading, subprocess, argparse, json, tomllib
-from concurrent.futures import ThreadPoolExecutor
+import sys, re, os, argparse, json
 from datetime import date, timedelta
 from pathlib import Path
 
-# ── Vendored task core ────────────────────────────────────────────────────────
-# Synced from brunnorpdias/tdiff@92f195c ("name weeks relative to this one").
-# Keep this block byte-identical to tdiff's where marked; tools/check-core-sync.sh
-# verifies it. Divergences are called out inline.
+# Everything tcat and tdiff both need lives in tnotes, one copy, imported rather than
+# vendored. This file used to carry a marked copy of that block with a pinned commit
+# hash and a check script; the pin went stale, parse_note and clean_text drifted, and
+# the check never covered materialize or load_config at all — so the two tools quietly
+# disagreed about which status a deduped task carries. One copy cannot drift.
+sys.path.insert(0, str(Path.home() / '.local' / 'lib'))
+try:
+    import tnotes as tn
+except ImportError:
+    sys.stderr.write("tcat: cannot import tnotes — symlink it into "
+                     f"{Path.home() / '.local' / 'lib' / 'tnotes.py'}\n")
+    raise SystemExit(2)
+tn.init('tcat')
 
-_SEP_RE = re.compile(r' [-–—] ')  # hyphen, en-dash, em-dash
-
-def strip_section_suffix(s):
-    """Remove trailing ' – ...' only when the dash is outside of [...] brackets."""
-    depth = 0
-    for i, c in enumerate(s):
-        if c == '[':
-            depth += 1
-        elif c == ']':
-            depth = max(0, depth - 1)
-        elif depth == 0 and c == ' ' and _SEP_RE.match(s, i):
-            return s[:i].strip()
-    return s.strip()
-
-WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
-
-def _strip_wiki_path(m):
-    inner = m.group(1)
-    if '|' in inner:
-        target, alias = inner.split('|', 1)
-        return f'[[{target.rsplit("/", 1)[-1]}|{alias}]]'
-    return f'[[{inner.rsplit("/", 1)[-1]}]]'
-
-def normalize_wikilinks(s):
-    return WIKILINK_RE.sub(_strip_wiki_path, s)
-
-_PUNCT = ',.;:!?-—…'
-
-def _tokens(s):
-    out = []
-    for t in s.split():
-        t = t.lower().strip(_PUNCT)
-        if t:
-            out.append(t)
-    return out
-
-def cluster_records(records):
-    """Cluster records that name the same logical task, using union-find. Two bases
-    are the same task when their token sets are equal, or when one is a strict subset
-    of the other and both start with the same token. Returns a list of clusters (each
-    a list of records) in first-seen order of their root base."""
-    bases_in_order, seen = [], set()
-    for base, _, _ in records:
-        if base not in seen:
-            seen.add(base)
-            bases_in_order.append(base)
-
-    parent = {b: b for b in bases_in_order}
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    # Bucketing on the two merge keys gives the same clusters as an all-pairs scan
-    # without tokenizing (or comparing) every pair. Tokenless bases could only merge
-    # by exact string equality, which distinct bases never satisfy — so skip them.
-    by_tokens, by_first = {}, {}
-    for b in bases_in_order:
-        toks = _tokens(b)
-        if not toks:
-            continue
-        key = frozenset(toks)
-        by_tokens.setdefault(key, []).append(b)
-        by_first.setdefault(toks[0], []).append((b, key))
-
-    for group in by_tokens.values():
-        for b in group[1:]:
-            union(group[0], b)
-    for group in by_first.values():
-        for i, (a, sa) in enumerate(group):
-            for b, sb in group[i + 1:]:
-                if sa < sb or sb < sa:
-                    union(a, b)
-
-    by_root = {}
-    for rec in records:
-        by_root.setdefault(find(rec[0]), []).append(rec)
-
-    clusters, emitted = [], set()
-    for b in bases_in_order:
-        r = find(b)
-        if r in emitted:
-            continue
-        emitted.add(r)
-        clusters.append(by_root[r])
-    return clusters
-
-def week_span(d):
-    """Return (sunday, saturday, label) for the US-format Sun-Sat week containing d."""
-    if isinstance(d, str):
-        d = date.fromisoformat(d)
-    days_back = (d.weekday() + 1) % 7   # Mon=0..Sun=6 -> Sun=0
-    sun = d - timedelta(days=days_back)
-    sat = sun + timedelta(days=6)
-    # The label's year is the *Saturday's*, not the Sunday's. Week 1 is the week
-    # containing Jan 1, so a week straddling New Year belongs to the year it ends
-    # in — which is what the vault's moment `gggg[-W]ww` filenames say. Anchoring
-    # on the Sunday called Sun 2026-12-27 → Sat 2027-01-02 `2026-W53`, a file that
-    # does not exist, and made the vault's real `2027-W01` unreachable by name.
-    # Only the straddling week per year is affected; all others are unchanged.
-    jan1 = date(sat.year, 1, 1)
-    days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
-    week_num = ((sun - jan1).days + days_back) // 7 + 1
-    return sun, sat, f"{sat.year}-W{week_num:02d}"
-
-_WEEK_REL_RE   = re.compile(r'[wW]([-+]\d+|0)$')
-_WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
-_WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
-
-def resolve_week_label(s):
-    """Return 'YYYY-W##' if s is a w## specifier, else None.
-
-    Three spellings, tried in this order. `w2026-W30` names a week outright. `w-1` / `w0`
-    / `w+1` are relative to the week containing today, and are what replaced the offset
-    flags both tools used to carry. `w30` is a bare week number in the current year.
-
-    The relative form has to be tried before the bare number, or `w0` would read as week
-    zero — a week no calendar has, and one that used to resolve to a phantom label.
-    """
-    m = _WEEK_FULL_RE.fullmatch(s)
-    if m:
-        return m.group(1)
-    m = _WEEK_REL_RE.fullmatch(s)
-    if m:
-        return week_span(date.today() + timedelta(weeks=int(m.group(1))))[2]
-    m = _WEEK_SHORT_RE.fullmatch(s)
-    if m:
-        return f'{date.today().year}-W{int(m.group(1)):02d}'
-    return None
-
-def _week_label_to_sunday(week_label):
-    """Convert 'YYYY-W##' (US convention: week 1 contains Jan 1, weeks start Sunday)."""
-    year, week_num = int(week_label[:4]), int(week_label[6:])
-    jan1 = date(year, 1, 1)
-    days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
-    return jan1 - timedelta(days=days_back) + timedelta(weeks=week_num - 1)
-
-# ── End vendored core ─────────────────────────────────────────────────────────
-
-# DIVERGENCE from tdiff: tcat reduces a cluster by *page position*, not by
-# STATUS_PRIORITY. Within a single note the last occurrence is the most recent
-# statement of a task's state, so it wins outright.
-def materialize(clusters):
-    """Reduce each cluster to (canonical_base, winning_status). Last occurrence wins."""
-    tasks, order = {}, []
-    for members in clusters:
-        last = max(members, key=lambda r: r[2])
-        canonical, winning = last[0], last[1]
-        order.append(canonical)
-        tasks[canonical] = winning
-    return tasks, order
-
-# Populated by load_config(). Placeholder values so nothing explodes if referenced
-# before load_config() runs.
-#
-# There are deliberately NO built-in ranks, colours or roles. The status vocabulary
-# describes the user's vault, not this tool, and inventing a fallback table is how
-# the old build ended up sorting by ranks nobody had chosen. With no config at all
-# tcat still runs — everything unranked and uncoloured — and says so once on stderr.
-DISPLAY_ORDER     = {}     # char -> rank, derived from [order].statuses position
-THEMES           = {}     # theme name -> {char: '#rrggbb'}
-FULL_ROW         = set()  # statuses whose whole row takes the colour, not just [x]
-HIDDEN_STATUSES  = set()
-SETTLED_STATUSES = set()  # terminal states, hidden only when -I asks
-PROJECT_STATUSES = set()
-DAILY_FOLDER  = ''
-WEEKLY_FOLDER = ''
-CONFIG_FOUND  = False
-
-# Anything absent from [order].statuses sorts last, in a block, alphabetically.
-UNRANKED = 10 ** 6
-
-def display_rank(ch):
-    """Sort rank for a status char, from [order].statuses.
-
-    A status the table does not list ranks last as a block — alphabetical within it,
-    since the name is the next sort key — which is what the shipped statuses.toml
-    promises and what tcat does with the same list. report_unlisted() names them.
-    """
-    return DISPLAY_ORDER.get(ch, UNRANKED)
-
-# Config complaints are advisory, never fatal, and never belong in a pipe: they are
-# collected here and flushed to stderr at the end, unless --json or --no-summary
-# asked for output with nothing around it.
-NOTICES = []
-
-def notice(msg):
-    NOTICES.append(msg)
-
-def _merge(base, overlay):
-    """Recursive dict merge; the overlay wins.
-
-    Lists replace wholesale rather than concatenating: an overlay that names a
-    partial [order].statuses means exactly that order, not an insertion into a
-    lower layer's list.
-    """
-    for k, v in overlay.items():
-        if isinstance(v, dict) and isinstance(base.get(k), dict):
-            _merge(base[k], v)
-        else:
-            base[k] = v
-
-def _xdg_base():
-    xdg = os.environ.get('XDG_CONFIG_HOME')
-    return Path(xdg) if xdg else Path.home() / '.config'
-
-def config_paths(override):
-    """Every config source, lowest precedence first.
-
-    The status table describes the vault's notation, not this tool, so its home is
-    obsidian-tasks/ — a directory neither tcat nor tdiff owns, which is what lets
-    the two share one table without either depending on the other being installed.
-    tcat's own directory is an optional overlay for tcat-only settings.
-
-    Each source *merges* over the ones below it, including $TCAT_CONFIG and
-    --config. A partial file must never erase what a lower layer set.
-    """
-    base = _xdg_base()
-    paths = [base / 'obsidian-tasks' / 'statuses.toml',
-             base / 'tcat' / 'config.toml']
-    env = os.environ.get('TCAT_CONFIG')
-    if env:
-        paths.append(Path(env))
-    if override:
-        paths.append(Path(override))
-    return paths
-
-def load_config(override, error):
-    """Merge every config layer and populate the module-level globals.
-
-    Never bootstraps a file and never fails on a missing one: no config is a valid
-    (if uncoloured) state, reported once by notice(). Only unparseable TOML is an
-    error.
-    """
-    global DISPLAY_ORDER, THEMES, FULL_ROW, HIDDEN_STATUSES, PROJECT_STATUSES
-    global SETTLED_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
-
-    merged = {}
-    for path in config_paths(override):
-        if not path.exists():
-            continue
-        try:
-            with path.open('rb') as f:
-                data = tomllib.load(f)
-        except tomllib.TOMLDecodeError as e:
-            error(f'invalid config at {path}: {e}')
-            return
-        CONFIG_FOUND = True
-        _merge(merged, data)
-
-    # Rank is list position, so ties cannot be expressed and reordering is a move.
-    statuses = merged.get('order', {}).get('statuses', [])
-    DISPLAY_ORDER = {c: i for i, c in enumerate(statuses)}
-
-    THEMES = {name: dict(table)
-              for name, table in merged.get('theme', {}).items()
-              if isinstance(table, dict)}
-
-    roles = merged.get('roles', {})
-    PROJECT_STATUSES = set(roles.get('project', []))
-    HIDDEN_STATUSES  = set(roles.get('hide', []))
-    SETTLED_STATUSES = set(roles.get('settled', []))
-    FULL_ROW         = set(roles.get('full_row', []))
-
-    vault = merged.get('vault', {})
-    DAILY_FOLDER  = vault.get('daily_folder', '')
-    WEEKLY_FOLDER = vault.get('weekly_folder', '')
-
-
-# ── Note reading ──────────────────────────────────────────────────────────────
-
-class ObsidianError(Exception):
-    """The obsidian CLI could not be run, or reported an error we can't interpret.
-    `retry` is False for permanent failures (no binary), True for ones observed to be
-    transient. `stalled` marks the timeout case, which is worth telling the user about
-    because it's the only failure they feel as a pause."""
-    def __init__(self, msg, retry=True, stalled=False):
-        super().__init__(msg)
-        self.retry = retry
-        self.stalled = stalled
-
-# A note that simply doesn't exist is normal (a day with no note, a week with no
-# planning note) — obsidian reports it on stdout with exit status 0.
-_MISSING_FILE_RE = re.compile(r'^Error: File "[^"]*" not found\.$')
-_NEW_PREFIX_RE   = re.compile(r'^\(new\)\s*', re.IGNORECASE)
-
-def _env_int(name, default):
-    try:
-        return max(1, int(os.environ[name]))
-    except (KeyError, ValueError):
-        return default
-
-# Concurrency is a small win (4 and 8 workers measure the same), so keep it low —
-# the obsidian CLI talks to a single running app. TCAT_WORKERS=1 forces serial reads.
-FETCH_WORKERS = _env_int('TCAT_WORKERS', 4)
-
-# Roughly one obsidian call in a few hundred wedges and never returns, at the same
-# rate whether we read serially or concurrently. The wedge is per-invocation — the app
-# keeps answering everything else — so a short deadline plus a fresh call is the cure.
-# A healthy call takes ~10ms (20ms worst of 320 measured), so 1s is ~100x headroom and
-# keeps a stall inside the second this tool should always finish in. A merely slow call
-# is not lost by a tight deadline: the retry catches it.
-OBSIDIAN_TIMEOUT  = _env_int('TCAT_TIMEOUT', 1)   # seconds per call
-OBSIDIAN_ATTEMPTS = 3
-SLOW_NOTICE_AFTER = 2.5     # seconds before telling the user we're waiting, not hung
-DEBUG = bool(os.environ.get('TCAT_DEBUG'))
-
-_lines_cache = {}
-
-def die(msg):
-    """Report a fatal error and leave immediately. os._exit() because a wedged
-    obsidian call can leave a pool thread blocked, and a normal exit would hang
-    joining it."""
-    sys.stdout.flush()
-    sys.stderr.write(f"tcat: {msg}\n")
-    sys.stderr.flush()
-    os._exit(2)
-
-def _on_uncaught(exc_type, exc, tb):
-    """Ctrl-C should leave at once — without a traceback, and without waiting on
-    reader threads that may be stuck on a slow obsidian call."""
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.stdout.flush()
-        sys.stderr.write('\ntcat: interrupted\n')
-        sys.stderr.flush()
-        os._exit(130)
-    sys.__excepthook__(exc_type, exc, tb)
-
-sys.excepthook = _on_uncaught
-
-def _run_obsidian(file_path):
-    """Return the raw markdown lines of one vault file, retrying a failure that might
-    be transient. Raises ObsidianError once the attempts are spent."""
-    for attempt in range(1, OBSIDIAN_ATTEMPTS + 1):
-        try:
-            return _obsidian_once(file_path)
-        except ObsidianError as e:
-            if not e.retry or attempt == OBSIDIAN_ATTEMPTS:
-                raise
-            if e.stalled:
-                sys.stderr.write(f"tcat: obsidian stalled on {file_path}, retrying\n")
-
-def _obsidian_once(file_path):
-    """One `obsidian read` call. Raises ObsidianError if the CLI is missing or its
-    output isn't something we can trust.
-
-    `read` rather than `tasks`: the flat task list `tasks` returns has already
-    thrown away the headings, and the ladder markers under ### *Actio* are the only
-    thing that says which of a weekly note's tasks are the week's plan. tcat has
-    always read raw markdown for that reason; this is the seam where the two tools
-    stopped disagreeing about what a note contains."""
-    argv = ['obsidian', 'read', f'file={file_path}']
-    started = time.monotonic()
-    try:
-        # stdin is closed: this is never an interactive call, and a CLI that decided
-        # to read from the terminal would block every reader thread behind it.
-        result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                                text=True, timeout=OBSIDIAN_TIMEOUT)
-    except FileNotFoundError:
-        raise ObsidianError(
-            "the 'obsidian' CLI was not found on PATH — tcat reads the vault through it",
-            retry=False,
-        )
-    except subprocess.TimeoutExpired:
-        raise ObsidianError(
-            f"'obsidian read file={file_path}' produced nothing within "
-            f"{OBSIDIAN_TIMEOUT}s on {OBSIDIAN_ATTEMPTS} attempts — is Obsidian running "
-            f"with the vault open? (TCAT_TIMEOUT=N raises the limit)",
-            stalled=True,
-        )
-    except OSError as e:
-        raise ObsidianError(f"could not run 'obsidian': {e}")
-
-    if DEBUG:
-        sys.stderr.write(f"tcat: {time.monotonic() - started:6.3f}s  {file_path}\n")
-
-    out, err = result.stdout, result.stderr.strip()
-    if result.returncode != 0:
-        detail = err or out.strip()
-        first = detail.splitlines()[0] if detail else '(no output)'
-        raise ObsidianError(f"'obsidian read file={file_path}' exited {result.returncode}: {first}")
-
-    lines = out.splitlines()
-    if not lines:
-        # An empty note is a legitimately empty side, the same as a missing one.
-        return []
-    # Only the *first* line can be an error report. Scanning them all was safe while
-    # this read a task list; on raw markdown a note that happens to open a line with
-    # "Error:" would be misread as a failed read.
-    first = lines[0].strip()
-    if _MISSING_FILE_RE.match(first):
-        return []
-    if first.startswith('Error:'):
-        raise ObsidianError(f"obsidian could not read {file_path!r}: {first}")
-    if not out.strip() and err:
-        raise ObsidianError(f"obsidian returned nothing for {file_path!r}: {err.splitlines()[0]}")
-    return lines
-
-def obsidian_lines(file_path):
-    """Memoized markdown lines for one vault file."""
-    if file_path not in _lines_cache:
-        try:
-            _lines_cache[file_path] = _run_obsidian(file_path)
-        except ObsidianError as e:
-            die(str(e))
-    return _lines_cache[file_path]
-
-def prefetch(paths):
-    """Warm the line cache for several vault files at once. Each obsidian call is
-    mostly waiting on the app, so overlapping them is a win for week modes.
-
-    `read` returns a whole note where `tasks` returned a handful of lines, so each
-    payload is larger — but the call count is unchanged, and the wait was always
-    the round trip rather than the bytes."""
-    todo = [p for p in dict.fromkeys(paths) if p not in _lines_cache]
-    if not todo:
-        return
-    # Named slow_timer, not notice: notice() is the deferred-message function, and a
-    # local of that name here would shadow it for the whole body.
-    slow_timer = threading.Timer(SLOW_NOTICE_AFTER, sys.stderr.write,
-                                 (f"tcat: waiting on obsidian ({len(todo)} files)…\n",))
-    slow_timer.daemon = True
-    slow_timer.start()
-    try:
-        if FETCH_WORKERS < 2 or len(todo) < 2:
-            for p in todo:
-                obsidian_lines(p)
-            return
-        # Both branches go through obsidian_lines() so the vault read has exactly one
-        # seam. Submitting _run_obsidian directly used to leave the memo wrapper
-        # bypassed on the concurrent path — a second entry point that anything hooking
-        # the read would silently miss.
-        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
-            for p in todo:
-                ex.submit(obsidian_lines, p)
-    finally:
-        slow_timer.cancel()
-
-TASK_RE = re.compile(r'^(\s*)- (\[.\]) (.+)$')
-H2_RE   = re.compile(r'^##\s+\*(\w+)\*')
-H3_RE   = re.compile(r'^###\s+\*(\w+)\*')
-MARK_RE = re.compile(r'^\*{2,3}([a-z]+)\*{2,3}\s*$')
-MDLINK_RE = re.compile(r'\[([^\[\]]+)\]\([^()]*\)')
-
-# The weekly day ladder. A whitelist, never a blacklist — the weekly template
-# gains sections over time, and this is what keeps Ratio's **rationes** lines and
-# Mensis's prospect checkboxes out of every day.
-#
-# WEEK_DAYS is the ladder's day span on its own: -A asks for all seven at once,
-# and deriving LADDER from it keeps the two from drifting apart.
-WEEK_DAYS = ('sunday', 'monday', 'tuesday', 'wednesday',
-             'thursday', 'friday', 'saturday')
-LADDER = ('promissum',) + WEEK_DAYS + ('future',)
-
-def clean_text(s):
-    """Un-escape Obsidian's bracket escapes, drop a trailing ' – ...' section suffix,
-    then shorten wikilink paths and reduce markdown links to their display text.
-
-    **The order is the whole point, and it diverges from tcat.** `strip_section_suffix`
-    only skips a dash it can see is inside brackets, so it has to run while the
-    brackets are still there. tcat reduces links first, which leaves
-    `[[marc randolph on building netflix – tim ferriss (496)]]` looking like prose with
-    a section suffix and truncates it at the dash — 18 of 455 names in this vault, some
-    down to a third of their length. Un-escaping stays first either way, or `\\[\\[foo]]`
-    never registers as bracket depth at all.
-
-    Wikilinks keep their brackets (`normalize_wikilinks` only shortens the path), which
-    is the second divergence: tdiff has always displayed `complete [[2026-W28]]`, and a
-    name is a name whether or not the vault happened to link it. Markdown links do get
-    reduced — that part is new, and without it a name carries a full URL.
-    """
-    s = s.replace('\\[', '[').replace('\\]', ']')
-    s = strip_section_suffix(s)
-    s = normalize_wikilinks(s)
-    return MDLINK_RE.sub(lambda m: m.group(1), s)
-
-def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
-    """Yield (indent, status_char, name, seq) for tasks in a note.
-
-    Fence-agnostic by design: ``` lines are ignored, never toggled. The weekly
-    note's whole Fixa section is itself fenced, so toggling desynchronises. Every
-    `base`/`dataviewjs` block lives under ## *Recensio*, ahead of ### *Actio*.
-
-    region/day: when both are given, only tasks under that ### heading and that
-    ladder marker are yielded (weekly mode). `day` takes one marker name or a
-    tuple of them — WEEK_DAYS folds the whole week into one pass, which is what
-    -A -P wants. When neither is given, every task in the note is yielded (daily
-    mode).
-
-    skip_future: drop tasks sitting under a **future** marker. Only -A passes it.
-    A daily note's future bucket is fair to show for that one day, but aggregating
-    a week would fold deferred work in alongside what actually happened — and a
-    pre-split Sunday's bucket holds a whole week of it.
-    """
-    days = (day,) if isinstance(day, str) else day
-    cur_region = cur_day = None
-    seq = 0
-    for line in lines:
-        if H2_RE.match(line):
-            cur_region = cur_day = None
-            continue
-        m = H3_RE.match(line)
-        if m:
-            cur_region = m.group(1).lower()
-            cur_day = None
-            continue
-        m = MARK_RE.match(line)
-        if m and m.group(1) in LADDER:
-            # Once inside **future**, stay there: a future fence may carry its own
-            # **sunday**/**other** markers that must not re-enter the ladder.
-            if cur_day != 'future':
-                cur_day = m.group(1)
-            continue
-        m = TASK_RE.match(line)
-        if not m:
-            continue
-        if not routines and '#routine' in line:
-            continue
-        if skip_future and cur_day == 'future':
-            continue
-        if region is not None and (cur_region != region or cur_day not in days):
-            continue
-        seq += 1
-        yield len(m.group(1)), m.group(2)[1], clean_text(m.group(3)), seq
-
-_HEAD_RE = re.compile(r'^#{1,6}\s')
-
-def extract_section(lines, name):
-    """Return one ### section's body verbatim, or None if the heading is absent.
-
-    The body runs from the heading to the next heading of any level. Leading and
-    trailing blank lines are stripped; everything else is untouched — no link
-    cleaning, no comment stripping, no section-suffix trimming. A heading with an
-    empty body returns '', which is what tells 'no such section' apart from
-    'nothing written there yet'.
-
-    Fence-agnostic like parse_note(): ``` lines are ignored. Safe here because
-    ### *Missio* carries prose only — every fenced block in the weekly note
-    (base/dataviewjs/markdown) lives under ## *Recensio* or ### *Fixa*.
-    """
-    body, inside = [], False
-    for line in lines:
-        if inside:
-            if _HEAD_RE.match(line):
-                break
-            body.append(line)
-            continue
-        m = H3_RE.match(line)
-        if m and m.group(1).lower() == name:
-            inside = True
-    if not inside:
-        return None
-    while body and not body[0].strip():
-        body.pop(0)
-    while body and not body[-1].strip():
-        body.pop()
-    return '\n'.join(body)
 
 # ── Grouping ──────────────────────────────────────────────────────────────────
 
@@ -602,7 +48,7 @@ def build_groups(note_records):
     for records in note_records:
         current = None
         for indent, status, name, seq in records:
-            if status in PROJECT_STATUSES and indent == 0:
+            if status in tn.PROJECT_STATUSES and indent == 0:
                 key = name.lower()
                 if key in index:
                     current = index[key]
@@ -628,12 +74,12 @@ def dedup(items):
     """
     if not items:
         return []
-    clusters = cluster_records([(n, s, q) for s, n, q in items])
-    tasks, order = materialize(clusters)
+    clusters = tn.cluster_records([(n, s, q) for s, n, q in items])
+    tasks, order = tn.materialize(clusters)
     return [(tasks[n], n) for n in order]
 
 def sort_key(status, name):
-    return (display_rank(status), name.lower())
+    return (tn.display_rank(status), name.lower())
 
 def order_rows(rows):
     """Sort rows by [order].statuses rank, then name. Every level of every view goes
@@ -665,11 +111,8 @@ _source_flags.add_argument('-D', '--dailies', action='store_true',
                     help="read only daily notes: on a w##, the week's seven; on a date, "
                          'the daily note, which is already the default')
 _source_flags.add_argument('-W', '--weekly',  action='store_true',
-                    help="read only the weekly note's ### *Actio*: on a date, that "
+                    help="read only the YYYY-W## weekly note: on a date, that "
                          "weekday's allocation; on a w##, the whole week's plan")
-parser.add_argument('--missio',         action='store_true',
-                    help="show the week's mission — the weekly note's ### *Missio* "
-                         "section, verbatim — instead of any tasks")
 parser.add_argument('-S', '--status',   type=str, default=None,
                     help="show only tasks whose status is in the given set "
                          "(concatenated chars, e.g. 'x-#'); prefix '^' to invert "
@@ -680,14 +123,16 @@ parser.add_argument('-I', '--ignore',   action='store_true',
                          '(done, cancelled, overrun, postponed, advanced) — leaving only '
                          'what is still open. Composes with -S, which wins for any '
                          'status it names outright')
-parser.add_argument('--routines',       action='store_true', help='include #routine tasks')
+parser.add_argument('--all',            action='store_true', dest='show_all',
+                    help='ignore the whole [exclude] table, sections and tags alike; '
+                         'fenced blocks are still skipped')
 parser.add_argument('--json',           action='store_true', help='machine-readable output')
 parser.add_argument('--no-color',       action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',     action='store_true', help='suppress the summary line')
 parser.add_argument('--config',         type=str, default=None,
                     help='additional (merging) config layer, applied last; the layers '
-                         'below it are ~/.config/obsidian-tasks/statuses.toml, '
-                         '~/.config/tcat/config.toml, then $TCAT_CONFIG')
+                         'below it are ~/.config/tconfig/notation.toml, statuses.toml '
+                         'and tcat.toml, then $TCAT_CONFIG')
 
 # argparse chokes on bare negative numbers like -1 before we can process them;
 # intercept them and turn them into a safe token first.
@@ -695,76 +140,38 @@ raw = sys.argv[1:]
 safe = [('__NEG__' + a[1:]) if re.fullmatch(r'-\d+', a) else a for a in raw]
 args = parser.parse_args(safe)
 
-load_config(args.config, parser.error)
+tn.load_config(args.config, parser.error, required=False)
 
 # No config is a valid state, not an error: tcat runs with everything unranked and
 # uncoloured rather than inventing ranks the user never chose. It just says so.
-if not CONFIG_FOUND:
-    notice('no status config found — showing unranked and uncoloured.\n'
-           '      see statuses.example.toml and config.example.toml')
-
-def restore(s):
-    if s.startswith('__NEG__'):
-        return '-' + s[7:]
-    return s
-
-_ISO_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
-_OFF_RE = re.compile(r'([-+])(\d+)')
-
-# One line each so tools/check-core-sync.sh, which compares constants by their
-# assignment line, actually covers them. Both the full name and its 3-letter prefix
-# map to the same index.
-_WEEKDAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-WEEKDAYS = {n[:k]: i for i, n in enumerate(_WEEKDAY_NAMES) for k in (3, len(n))}
-
-def resolve_date(s):
-    today = date.today()
-    if s in ('today', '0'):
-        return today.isoformat()
-    if s == 'yesterday':
-        return (today - timedelta(days=1)).isoformat()
-    if s == 'tomorrow':
-        return (today + timedelta(days=1)).isoformat()
-    low = s.lower()
-    if low in WEEKDAYS:
-        # Backwards: the most recent occurrence at or before today. A future day
-        # has no tasks yet, so resolving forwards would always come back empty.
-        days_back = (today.weekday() - WEEKDAYS[low]) % 7
-        return (today - timedelta(days=days_back)).isoformat()
-    m = _OFF_RE.fullmatch(s)
-    if m:
-        n = int(m.group(2))
-        if n < 1:
-            parser.error(f"invalid date: {s!r} (use 0 for today)")
-        delta = -n if m.group(1) == '-' else n
-        return (today + timedelta(days=delta)).isoformat()
-    if _ISO_RE.fullmatch(s):
-        try:
-            return date.fromisoformat(s).isoformat()
-        except ValueError:
-            parser.error(f"invalid date: {s!r}")
-    parser.error(
-        f"invalid date: {s!r} (expected YYYY-MM-DD, 'today', 'yesterday', "
-        f"'tomorrow', '0', -N/+N, a weekday name, or w##)"
-    )
+if not tn.CONFIG_FOUND:
+    tn.notice('showing unranked and uncoloured — see notation.example.toml and '
+              'statuses.example.toml in the tnotes repo')
 
 # A week mode is anything whose subject is the week rather than one day.
 # w30 / w-1 / w2026-W30 name a week; anything else names a day. That is the whole
 # scope rule — -D/-W then pick which of a week's two sources to read.
-raw_date = restore(args.date)
-week_arg = resolve_week_label(raw_date)
+def resolve_date(raw):
+    """tn.resolve_date, with the error routed back to this parser. The module raises
+    rather than reporting because the message belongs to the caller's argument parser,
+    which is the one thing a shared module cannot own — and is exactly why this
+    function used to sit outside the vendored block and drift from tdiff's."""
+    try:
+        return tn.resolve_date(raw)
+    except tn.DateError as e:
+        parser.error(str(e))
 
-if args.missio and (args.dailies or args.weekly):
-    parser.error('--missio already reads the weekly note; -D/-W have nothing to narrow')
+raw_date = tn.restore(args.date)
+week_arg = tn.resolve_week_label(raw_date)
 
 if week_arg:
-    target_d = _week_label_to_sunday(week_arg)
+    target_d = tn._week_label_to_sunday(week_arg)
     # Not every YYYY-W## string is a week. Labels are named for the year a week
     # ends in, so `2026-W53` maps onto a Sunday whose week is really 2027-W01 —
     # a phantom that would otherwise be read as if it were real. Round-tripping
     # the label through week_span() is what catches it. A relative label needs no
     # check: it came out of week_span() in the first place.
-    real_label = week_span(target_d)[2]
+    real_label = tn.week_span(target_d)[2]
     if real_label != week_arg:
         parser.error(f"{raw_date} is not a week in this calendar "
                      f"(that Sunday belongs to {real_label}); did you mean w{real_label}?")
@@ -783,7 +190,7 @@ if target_d > date.today() and not (args.weekly or week_arg):
 
 status_filter = None
 if args.status is not None:
-    v = restore(args.status)
+    v = tn.restore(args.status)
     negate = v.startswith('^')
     if negate:
         v = v[1:]
@@ -794,8 +201,8 @@ if args.status is not None:
 
 # Same contract as [order].statuses: no built-in table, so an unconfigured -I
 # filters nothing rather than inventing a set of statuses to call settled.
-if args.ignore and not SETTLED_STATUSES:
-    notice('-I: no [roles] settled in config — nothing to hide')
+if args.ignore and not tn.SETTLED_STATUSES:
+    tn.notice('-I: no [roles] settled in config — nothing to hide')
 
 def status_match(ch):
     """Is this status visible?
@@ -816,9 +223,9 @@ def status_match(ch):
         # A negated -S only names what to drop. It still overrides `hide` for
         # everything it didn't name, but -I is an explicit flag on the same
         # command line, so it keeps applying to the remainder.
-        return not (args.ignore and ch in SETTLED_STATUSES)
-    return (ch not in HIDDEN_STATUSES
-            and not (args.ignore and ch in SETTLED_STATUSES))
+        return not (args.ignore and ch in tn.SETTLED_STATUSES)
+    return (ch not in tn.HIDDEN_STATUSES
+            and not (args.ignore and ch in tn.SETTLED_STATUSES))
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -860,12 +267,12 @@ RESET = '\033[0m' if use_color else ''
 THEME = _pick_theme()
 STATUS_SGR = {}          # char -> SGR escape; absent means default foreground
 if use_color:
-    for _ch, _hex in THEMES.get(THEME, {}).items():
+    for _ch, _hex in tn.THEMES.get(THEME, {}).items():
         _esc = _sgr(_hex)
         if _esc:
             STATUS_SGR[_ch] = _esc
         else:
-            notice(f'ignoring unusable colour {_hex!r} for status {_ch!r}')
+            tn.notice(f'ignoring unusable colour {_hex!r} for status {_ch!r}')
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
 
@@ -884,7 +291,7 @@ def row(status, name, indent):
     c = STATUS_SGR.get(status, '')
     if not c:
         return f'{indent}[{status}] {name}'
-    if status in FULL_ROW:
+    if status in tn.FULL_ROW:
         return f'{indent}{c}[{status}] {name}{RESET}'
     return f'{indent}{c}[{status}]{RESET} {name}'
 
@@ -893,7 +300,7 @@ def footer(contents, mode, note_field):
     return f'  {DIM}' + '  ·  '.join([contents, mode, note_field]) + RESET
 
 def flush_notices():
-    for m in NOTICES:
+    for m in tn.NOTICES:
         print(f'tcat: {m}', file=sys.stderr)
 
 def finish(code=0):
@@ -909,51 +316,23 @@ def report_unlisted(statuses):
     They still render — unranked, at the bottom, uncoloured — but silently doing so
     would look like a sort bug rather than a gap in the config.
     """
-    if not CONFIG_FOUND:
+    if not tn.CONFIG_FOUND:
         return
-    missing = sorted(s for s in statuses if s not in DISPLAY_ORDER)
+    missing = sorted(s for s in statuses if s not in tn.DISPLAY_ORDER)
     if missing:
         shown = ' '.join(f'[{s}]' for s in missing)
-        notice(f'not in [order].statuses, so shown last and uncoloured: {shown}')
+        tn.notice(f'not in [order].statuses, so shown last and uncoloured: {shown}')
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 WEEKDAY_NAME = ['monday', 'tuesday', 'wednesday', 'thursday',
                 'friday', 'saturday', 'sunday'][target_d.weekday()]
-week_sun, _, week_label = week_span(target_d)
+week_sun, _, week_label = tn.week_span(target_d)
 
-WEEKLY_NAME = f'{WEEKLY_FOLDER}/{week_label}' if WEEKLY_FOLDER else week_label
+WEEKLY_NAME = f'{tn.WEEKLY_FOLDER}/{week_label}' if tn.WEEKLY_FOLDER else week_label
 
 def daily_name(d):
-    return f'{DAILY_FOLDER}/{d}' if DAILY_FOLDER else d
-
-# ── Missio ────────────────────────────────────────────────────────────────────
-#
-# Standalone: the week's mission is prose, not tasks, so this branch reads the
-# weekly note, prints, and exits before any of the task machinery is consulted.
-if args.missio:
-    lines = obsidian_lines(WEEKLY_NAME)
-    # obsidian_lines returns [] for a missing note, and extract_section returns None
-    # for a note with no such heading — so the missing-file guard is redundant.
-    body = extract_section(lines, 'missio')
-    body = body or None      # '' (heading present, nothing written) reads as absent
-
-    if args.json:
-        print(json.dumps({'week': week_label, 'missio': body},
-                         ensure_ascii=False, indent=2))
-        finish()
-
-    if body:
-        for line in body.split('\n'):
-            print(f'  {line}' if line.strip() else '')
-    elif not args.no_summary:
-        print(f'  {DIM}nothing to show{RESET}')
-    if not args.no_summary:
-        # Prose isn't countable, but every mode keeps all three footer fields so
-        # the shape never changes: contents · mode · file.
-        print()
-        print(footer('text', 'missio', week_label))
-    finish()
+    return f'{tn.DAILY_FOLDER}/{d}' if tn.DAILY_FOLDER else d
 
 # ── Read plan ─────────────────────────────────────────────────────────────────
 #
@@ -961,17 +340,17 @@ if args.missio:
 # and the source -D/-W asked for. Everything downstream reads it, so there is exactly
 # one place that decides what a given invocation opens.
 
-# A single day read on its own keeps its **future** bucket — deferring something is
-# part of that day. Folded into a week it goes, or a pre-split Sunday's bucket drags a
-# whole week of deferred work in beside what actually happened.
-DAY_KW        = {}
-WEEK_DAY_KW   = {'skip_future': True}
-# A whole week's plan takes the unallocated tasks too: `None` leads the whitelist and
-# catches everything under ### *Actio* that never got a **weekday** marker. On an
-# organised week it matches nothing; on a week still being drafted it is the entire
-# plan — 2026-W34 currently holds 37 such tasks and 0 allocated ones. A single day is
-# the opposite question, "what did I put on Monday", so it asks for the marker alone.
-WEEK_PLAN_KW  = {'region': 'actio', 'day': (None,) + WEEK_DAYS}
+# Every note is read whole. There is nothing left to say about *which* sections to
+# read: a vault that wants one kept out names it in [exclude] sections, and a task
+# list frozen in a fenced block is skipped whatever the config says.
+#
+# This used to be three kwarg tables pinning the read to one heading and to a
+# whitelist of day markers, both spelled into the source — so a plan parked under a
+# heading this file had never heard of was unreachable however the config was written,
+# and a daily note's deferred-work section was dropped from a week aggregation by a
+# rule that hardcoded both that such a section exists and what it means. No section
+# name appears anywhere in this script now.
+NOTE_KW = {}
 
 if week_arg:
     entries = []
@@ -980,27 +359,36 @@ if week_arg:
     # statement beat it — the same precedence tdiff gets by giving the weekly note
     # day_index 0 so it loses every tie.
     if not args.dailies:
-        entries.append((WEEKLY_NAME, WEEK_PLAN_KW))
+        entries.append((WEEKLY_NAME, NOTE_KW))
     if not args.weekly:
-        entries += [(daily_name((week_sun + timedelta(days=i)).isoformat()), WEEK_DAY_KW)
+        entries += [(daily_name((week_sun + timedelta(days=i)).isoformat()), NOTE_KW)
                     for i in range(7)]
 else:
-    entries = ([(WEEKLY_NAME, {'region': 'actio', 'day': WEEKDAY_NAME})] if args.weekly
-               else [(daily_name(target), DAY_KW)])
+    # -W on a date asks the weekly note for one weekday's allocation, which is the
+    # mirror image of tdiff's anchor bound — hence only_days beside skip_days in the
+    # shared parse_note. Which lines are markers comes from [days]; with none
+    # configured nothing opens a day and this reads empty, which is the honest answer
+    # for a vault that does not allocate tasks to days.
+    entries = ([(WEEKLY_NAME, {'only_days': (WEEKDAY_NAME,)})] if args.weekly
+               else [(daily_name(target), NOTE_KW)])
 
-prefetch([n for n, _ in entries])
+tn.prefetch([n for n, _ in entries])
 
 # Grouped per note, because build_groups() must not let a project header left open at
 # the end of one note adopt the indented tasks at the start of the next.
 note_records, notes_read, seq0 = [], [], 0
 for name, kw in entries:
-    lines = obsidian_lines(name)
+    lines = tn.obsidian_lines(name)
     # A missing day is ordinary — this vault averages six notes in seven — so a gap is
     # skipped and counted, never an error.
     if not lines:
         continue
     notes_read.append(name)
-    recs = list(parse_note(lines, routines=args.routines, **kw))
+    recs = list(tn.parse_note(
+        lines,
+        exclude=() if args.show_all else tn.EXCLUDED_SECTIONS,
+        exclude_tags=() if args.show_all else tn.EXCLUDED_TAGS,
+        day_patterns=tn.DAY_PATTERNS, **kw))
     # parse_note restarts seq at 1 every call, so the offset is applied here and
     # advanced by what the note actually yielded. Drop it and "last in page order"
     # quietly becomes "last in whichever note".

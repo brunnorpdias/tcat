@@ -1,0 +1,17 @@
+# tcat-only overrides. Optional, and usually absent.
+#
+# Install to ~/.config/tconfig/tcat.toml. Everything that describes the vault lives in
+# that folder's notation.toml and statuses.toml, shipped by `tnotes` and read by both
+# tools. This file is for the cases where you want tcat to differ from tdiff — which
+# should be rare, since a vault that looked like two vaults depending on which tool
+# asked was the problem the shared folder solves.
+#
+# It is an overlay, not a replacement: a partial file here never erases what a lower
+# layer set. Lists do replace wholesale, though — a partial [order].statuses means
+# exactly that order with everything else sorting last.
+#
+# [roles]
+# full_row = ["x", "-"]    # colour the whole row, not just the status box
+#
+# [order]
+# statuses = ["!", "*", " ", "x"]

@@ -2,69 +2,49 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Vault findings — read this first
+## What the vault taught us, and what is left of it
 
-These were established empirically against the live vault and are the foundation of the
-whole design. Re-verify before changing the reader; don't re-derive from scratch.
+This file used to open with ten numbered findings about one vault — which sections are
+fenced, which heading holds the plan, which markers a day ladder accepts. **They are
+gone, and their absence is the point.** Every one of them was a fact about one person's
+notes that had been spelled into the source, and each decided on the tool's behalf where
+a plan lives. A vault that wrote things differently was unreachable however its config
+was written.
 
-1. **`obsidian tasks` carries no section context.** The trailing `– …` strings in its
-   output are inline notes written into the task text (of the form `some task –
-   superseded by another task`), not day markers. Day attribution is impossible
-   from the `tasks` subcommand. This is why `tcat` doesn't use it.
+What survives is only what is true of the *notation's shape* rather than of any vault:
 
-2. **`obsidian read file='<name>'` exists** and resolves wikilink-style, folder-agnostic —
-   same semantics as `tasks file=`. No vault-root path is ever needed.
+1. **`obsidian read`, not `obsidian tasks`.** The flat task list `tasks` returns has
+   already thrown away the headings an exclude list names, and the day markers that say
+   when a planned task was due. `tcat` has always read raw markdown; `tdiff` moved onto
+   it, and that is where the two stopped disagreeing about what a note contains.
 
-3. **`obsidian tasks` silently skips fenced code blocks.** On a representative weekly
-   note it returned exactly 51 tasks, because the whole `### *Fixa*` section and every
-   `**future**` bucket are fenced; 51 is precisely Actio's unfenced task lines.
+2. **Fenced blocks are skipped.** ` ``` ` / `~~~` toggle, and nothing inside is parsed.
+   This is a **reversal**: the reader used to ignore fences on purpose, because one
+   vault's frozen task section was itself wrapped in a fence and toggling desynchronised
+   the read. That argument was really an argument for naming the section, which
+   `[exclude] sections` now does — durably, since a section is skipped for what it is
+   called rather than for how it happens to be formatted. Fencing is how a vault freezes
+   a list; reading those as live tasks is a bug, and on `2026-05-17` it was 76 phantom
+   rows out of 85.
 
-4. **The reader is fence-agnostic on purpose.** ``` lines are ignored, never toggled.
-   Fence tracking is actively *harmful*: the Fixa section is itself wrapped in a fence, so
-   naive toggling desynchronises (in testing it silently dropped two Fixa days). Ignoring fences is
-   safe because every `base`/`dataviewjs` block lives under `## *Recensio*`, ahead of
-   `### *Actio*`. Verified: exact count parity with `obsidian tasks` on all ten ladder
-   weeks in the vault, zero unattributed tasks.
+3. **A missing note is ordinary.** No note, no matching section, nothing under a day
+   marker — all of these are an empty result and exit 0, never a parse failure.
 
-5. **`obsidian` exits 0 on a missing file** and prints `Error: File "..." not found.` to
-   **stdout** when not attached to a TTY (to stderr when it is). `read_note()` matches
-   that string explicitly — checking the exit code is not enough.
+4. **Dedup spans the whole read**, and the winner comes from `[dedup]` priority. See
+   **Architecture** step 4: this changed, and it is the one place `tcat`'s output moved
+   for a reason other than the fence.
 
-6. **Older weekly notes predate the day ladder.** Their `### *Actio*` is one flat week
-   list with no `**day**` markers (two such notes in testing held 36 and 46 tasks). `-W`
-   correctly returns nothing for a specific day, and says only `nothing to show` — the
-   distinct explanation `-v` used to give was removed along with the flag.
-
-7. **`### *Missio*` is unfenced prose.** It sits under `## *Prospectus*`, immediately
-   before `### *Actio*`, and holds paragraphs (sometimes a bullet list), not tasks.
-   Verified across every weekly note in the vault (`2026-W20`…`2026-W31`): present in 9,
-   **absent in W24–W26**, and no weekly note exists before W20 — the weekly structure lived
-   in the Sunday daily note back then. So a missing Missio is a normal state, never a parse
-   failure. `extract_section()` is fence-agnostic for the same reason `parse_note()` is, and
-   it is safe here because every fenced block lives under `## *Recensio*` or `### *Fixa*`.
-
-8. **Daily notes are ~6 of 7 per week, and pre-`2026-W20` Sundays are contaminated.**
-   Measured over the last eight full weeks: 7,6,5,4,7,5,7,7 notes. A week aggregator must
-   treat a missing day as ordinary, never an error. Worse, before W20 the weekly structure
-   lived inside the Sunday daily — `tcat 2026-05-17` returns **90 tasks** because that note
-   carries the coming week's whole plan inside a fence. A week read drops `**future**` (20 of
-   them in that note) which removes the largest slice; the rest is a documented known gap.
-   Do **not** "fix" it with fence tracking — see finding 4.
-
-9. **The `obsidian` CLI intermittently wedges.** A read that normally takes ~10 ms
-   occasionally hangs for minutes. Observed directly while building the week aggregation. It also **drains
-   stdin**, so every call needs `stdin=DEVNULL` or `tcat` eats its caller's input. Both are
-   handled in `_read_uncached()` (cap, retry, skip) — the same reasons `tdiff` guards its
-   calls. Don't remove either.
-
-10. **A `future` block can contain its own ladder markers.** One note's future fence
-   carried `**sunday**` and `**other**` inside it. Once inside `**future**`, the parser stays there — it
-   never re-enters the day ladder.
 
 ## What this project does
 
-`tcat` is a single-file Python CLI that shows **what is in a note**: one day's tasks, or
-one week's. `--missio` prints the weekly note's mission prose instead.
+`tcat` is a Python CLI that shows **what is in a note**: one day's tasks, or one week's.
+It reads the vault through `tnotes`, a module it shares with `tdiff`.
+
+**`--missio` is gone.** It printed one named section of one vault's weekly note as
+verbatim prose — a whole flag, a whole `extract_section()`, a whole JSON shape and a
+whole footer branch, all of them spelling a section name into the source. Nothing about
+it generalised, and the tool is leaner for its absence. A vault that wants prose out of a
+note has `obsidian read`.
 
 **The grammar is one sentence, and it is tdiff's: a date names a day, a `w##` names a
 week, and a week has two sources you narrow with `-D`/`-W`.** The positional picks the
@@ -73,10 +53,10 @@ scope, the flags pick the source.
 | invocation | reads |
 |---|---|
 | `tcat today` / `tcat today -D` | that day's daily note |
-| `tcat today -W` | the weekly note's Actio allocation for that weekday |
+| `tcat today -W` | the weekly note's allocation for that weekday |
 | `tcat w34` | the whole week, both sources merged and deduped |
 | `tcat w34 -D` | the week's seven daily notes |
-| `tcat w34 -W` | the week's Actio plan, whole |
+| `tcat w34 -W` | the week's plan, whole |
 
 `-D` on a date is a documented no-op — a day's daily note is already the default. It
 exists so the two flags read as a pair rather than as one flag with a gap.
@@ -95,15 +75,15 @@ to add plan-vs-daily columns, drift markers, or diffing of any kind; that is `td
 and the separation is deliberate.
 
 **The seam now lives entirely inside `tdiff`, and `tcat` owes it nothing.** Plan-vs-actual
-is `tdiff today -W`: tdiff reads the weekly note's Actio section itself now, so it no
-longer needs tcat to hand it a task set. `tdiff -E`, which used to take shell commands as
+is `tdiff today -W`: tdiff reads the weekly note itself, so it no longer needs tcat to
+hand it a task set. `tdiff -E`, which used to take shell commands as
 its two sides, was deleted in `596020d` — and with it the only consumer of tcat's nested
 `--json` envelope. That envelope is now flat `rows` in tdiff's shape, and nothing parses
 it; earlier docs here said to freeze it "because `tdiff` parses it", which stopped being
 true and is the reason the shape was free to change.
 
-External dependencies: `obsidian` CLI (`read` subcommand only). Requires Python 3.11+
-(stdlib `tomllib`). No `rg` — unlike `tdiff`, `tcat` parses note source directly.
+External dependencies: the `obsidian` CLI (`read` subcommand only) and `tnotes` on
+`~/.local/lib`. Requires Python 3.11+ (stdlib `tomllib`).
 
 ## Running
 
@@ -112,44 +92,44 @@ tcat [date|w##] [flags]            # no build step
 
 python3 tcat 2026-03-04 --no-color
 python3 tcat tuesday -W --no-color         # tuesday's allocation in the weekly plan
-python3 tcat 2026-01-07 -W --no-color      # pre-ladder week, empty
 python3 tcat 2026-03-04 --json
 python3 tcat w30 --no-color                # a week, both sources merged
 python3 tcat w30 -D --no-color             # the week actually done
 python3 tcat w30 -W --no-color             # the week as planned
 python3 tcat w0 --no-color                 # this week
 python3 tcat w-1 -D --json                 # last week's dailies
-python3 tcat --missio --no-color           # the week's mission, verbatim
-python3 tcat 2026-06-10 --missio           # a week with no Missio section
+python3 tcat today --all --no-color        # ignore [exclude]; fences still skipped
 ```
 
 No test suite — testing is manual via CLI invocation, as in `tdiff`.
 
 ## Architecture
 
-One executable file: `tcat`. Pipeline:
+One executable file, `tcat`, on top of `tnotes`. Pipeline — steps 1, 2 and 4 are the
+shared module's, and only the seams are described here:
 
-1. **Read** — `read_note()` shells out to `obsidian read file=<name>`, returns lines or
-   `None`. See finding 5 about the missing-file detection, and finding 9 for the timeout,
-   retry and `stdin=DEVNULL` guards. Results are memoised; `prefetch()` warms several notes
-   at once through a 4-worker pool (`TCAT_WORKERS`). It is now called on every path, since
-   the read plan is one list of notes; a single-note run takes the serial branch.
+1. **Read** — `tn.obsidian_lines()` memoises `obsidian read file=<name>`; `tn.prefetch()`
+   warms several notes at once through a 4-worker pool (`TNOTES_WORKERS`). It is called
+   on every path, since the read plan is one list of notes; a single-note run takes the
+   serial branch. The timeout, retry and `stdin=DEVNULL` guards live there too.
 
-   `survey_region()` used to sit here, existing only to tell empty results apart for `-v`.
-   Both are gone — see **Key behaviours**.
+2. **Parse** — `tn.parse_note()` yields `(indent, status_char, name, seq)`. Every note is
+   read **whole**, daily and weekly alike. `[exclude] sections` says what to leave out and
+   `[exclude] tags` says which task lines are not really tasks; `--all` ignores both for
+   one run, and neither lifts the fence.
 
-2. **Parse** — `parse_note()` yields `(indent, status_char, name, seq)`. Fence-agnostic
-   (finding 4). In weekly mode it filters to `region='actio'` and a ladder day; in daily
-   mode it yields everything. `day=` takes one marker name **or a tuple** of them —
-   a week read passes `(None,) + WEEK_DAYS`, which is why the whole plan is one pass.
-   `LADDER` is derived from `WEEK_DAYS` so the two can't drift.
-   `extract_section()` is the prose counterpart: it returns one `###` section's body
-   verbatim (`None` when the heading is absent, `''` when the body is), and is what
-   `--missio` runs on. It deliberately does **not** call `clean_text()`. `clean_text()` un-escapes `\[`/`\]` (the vault writes both
-   `\[\[a]]` and `[[a]]`), reduces links to display text, and strips the ` – …` suffix.
-   The ladder is a **whitelist** — `promissum`, `sunday`…`saturday`, `future` — never a
-   blacklist, because the weekly template gains sections over time. This is what keeps
-   Ratio's `**rationes**` lines and Mensis's prospect checkboxes out.
+   **The whitelists are gone.** The reader used to pin a weekly note to one `###` heading
+   and, within it, to a ladder of day markers spelled into the source — `promissum`,
+   `sunday`…`saturday`, `future` — with the argument that a template gains sections over
+   time and a whitelist is safer than a blacklist. The argument was sound about the risk
+   and wrong about the remedy: it made every section name a fact in the code, so a plan
+   parked under a heading this file had never heard of was unreachable however the config
+   was written. **No section name appears anywhere in the script now.**
+
+   What survives of the ladder is `only_days`, and only to answer `-W <date>`: which
+   weekday's allocation. Which lines are markers comes from `[days]`, a glob per weekday
+   supplied by the vault. With no `[days]` configured nothing opens a day, so `-W` on a
+   date reads empty — the honest answer for a vault that does not allocate tasks to days.
 
 3. **Group** — `build_groups()` folds flat records into project groups. A top-level
    `[p]`/`[i]`/`[u]` opens a group; indented tasks are its children. Groups **merge**
@@ -157,10 +137,18 @@ One executable file: `tcat`. Pipeline:
    `[[project alpha]]`), because block markers are hidden and five identical headers
    would be noise.
 
-4. **Dedup** — `cluster_records()` (vendored from `tdiff`) plus a **divergent**
-   `materialize()`: `tcat` reduces a cluster to its **last occurrence in page order**, not
-   by `STATUS_PRIORITY`. Within one note the last statement is the current one. This is
-   the single most important difference from `tdiff` and is marked in the source.
+4. **Dedup** — `tn.cluster_records()` and `tn.materialize()`, which now reduces a cluster
+   by **`[dedup]` priority**, tie-broken by page position.
+
+   **This changed, and it is the one place `tcat`'s output moved for a reason other than
+   the fence.** `tcat` used to take the last occurrence in page order outright — the
+   reasonable-sounding rule that the latest statement is the current one. It was also the
+   single most important divergence from `tdiff`, and precisely the disagreement the
+   vendored check could not see, because it never covered `materialize`: one vault, two
+   tools, two statuses for the same task. Priority is the better rule anyway — "done" is
+   the truest thing you can say about a task also written `[/]` on Tuesday, whichever line
+   came last — and page order survives as the tie-break, so within one note nothing
+   changes.
 
 5. **Sort & render** — `order_rows()` at every level: `(display_rank, name.lower())`,
    and nothing else. Output is always grouped and always in that order — `--flat` and
@@ -182,77 +170,82 @@ One executable file: `tcat`. Pipeline:
    the indented tasks at the start of the next — a real hazard once a week read opens
    eight notes, and one the old flat-stream `-A` was already exposed to.
 
-## Vendored core
+## Sharing with `tdiff`: `tnotes`
 
-The block between `# ── Vendored task core` and `# ── End vendored core` is copied
-verbatim from `tdiff` at pinned commit **`92f195c`**. The checked surface is now
-**15 functions and 18 constants** — roughly twice what it was, because a large amount of
-genuinely shared code was sitting outside the guard:
+Everything both tools need lives in **`tnotes`** (`~/Projects/tnotes/tnotes.py`),
+symlinked to `~/.local/lib/tnotes.py` the same way both scripts are symlinked into
+`~/.local/bin/`. No packaging, no install step; `tcat` puts that directory on
+`sys.path` and imports, reporting a missing symlink in a sentence rather than as a bare
+`ImportError`:
 
-| group | names |
-|---|---|
-| task names | `strip_section_suffix`, `clean_text`, `normalize_wikilinks`, `_strip_wiki_path`, `WIKILINK_RE`, `MDLINK_RE`, `_SEP_RE` |
-| parsing | `parse_note`, `TASK_RE`, `H2_RE`, `H3_RE`, `MARK_RE`, `WEEK_DAYS`, `LADDER` |
-| clustering | `cluster_records`, `_tokens`, `_PUNCT` |
-| dates & weeks | `week_span`, `resolve_date`, `resolve_week_label`, `_week_label_to_sunday`, `_WEEK_REL_RE`, `_WEEK_SHORT_RE`, `_WEEK_FULL_RE`, `_ISO_RE`, `_OFF_RE`, `_WEEKDAY_NAMES`, `WEEKDAYS` |
-| display & plumbing | `display_rank`, `UNRANKED`, `_xdg_base`, `notice`, `restore` |
-
-**`parse_note` came *from* `tcat`**, but `tdiff` is the canonical side now: it moved off
-`obsidian tasks` onto raw markdown in `596020d` and took tcat's parser with it. Both
-copies are identical; the pin is what says which one wins a disagreement.
-
-**`clean_text` was the one function that had genuinely drifted**, and reconciling it was a
-real fix rather than a formality. `tcat` used to reduce links to their display text
-*before* stripping the ` – …` section suffix, which truncated any linked title containing
-a dash. Measured on this vault: 106 of 435 names rendered differently, 22 of them losing
-text outright. It is now `tdiff`'s: un-escape → `strip_section_suffix` → shorten wikilink
-paths, brackets kept → reduce markdown links. Names therefore display as
-`read [[2026 mechanica]]`, which is a visible change and the right one.
-
-**`resolve_date` is checked too, but lives outside the block** — in both files, because it
-needs `parser` and so has to follow the argument parser. It is vendored all the same: the
-promise that `tcat` and `tdiff` take the same date arguments (weekday names, `tomorrow`,
-`-N`/`+N`, `w##`, `w-1`) is only true if it cannot drift. `_WEEKDAY_NAMES` and `WEEKDAYS`
-are deliberately one-liners, because the script's constant check compares a single
-assignment line and a multi-line `WEEKDAYS` would have been checked only on its first.
-`UNRANKED` carries no trailing comment in either file for the same reason — `tdiff` moved
-its comment to the line above so the two assignment lines match exactly.
-
-One deliberate divergence, and it is in the caller rather than the function: `tcat`
-hard-errors on a future date without `-W` (or a `w##`), since the daily note won't exist
-yet. `tdiff` accepts it — an empty side is a legitimate diff.
-
-**`is_same_task` is gone** — upstream folded it into `cluster_records`, which now buckets
-on the two merge keys instead of scanning all pairs. Same clusters, ~3× faster on `tdiff`'s
-inputs and immaterial on `tcat`'s. It came in with the `e2976c0` pin bump rather than
-being chosen: the whole block moves together or the sync check goes red. Verified inert
-against eleven `--json` captures across five weeks before landing.
-
-Vendoring beats a shared module: two files on `$PATH` with no install step is the
-deployment model. Keep it honest with:
-
-```bash
-tools/check-core-sync.sh [path-to-tdiff-repo]   # exit 1 on any drift
+```python
+sys.path.insert(0, str(Path.home() / '.local' / 'lib'))
+import tnotes as tn
+tn.init('tcat')
 ```
 
-Deliberately **not** checked, and the script says why in a comment: `materialize` (tcat
-reduces a cluster by page position, tdiff by `STATUS_PRIORITY` — see pipeline step 4);
-`load_config`/`config_paths`/`_merge` (different env var, and tcat survives with no config
-where tdiff hard-errors); `die`/`_on_uncaught`/`_obsidian_once`/`_run_obsidian`/`prefetch`/
-`flush_notices`/`finish` (each prints the tool's own name); and
-`build_groups`/`dedup`/`sort_key`/`order_rows`/`status_match` (tcat-only shape — tdiff
-groups inside its own parser). If you change anything inside the vendored block, either
-revert it or move it out of the block and document why.
+**This replaced vendoring, and the history is the argument for it.** `tcat` used to
+carry a marked copy of `tdiff`'s task core with a pinned commit hash, verified by
+`tools/check-core-sync.sh`. It failed the way vendoring always does: the pin went stale
+(`92f195c`, two `tdiff` commits behind at the end), `parse_note` and `clean_text`
+drifted, and the check *never covered `materialize` or `load_config` at all* — so the
+two tools quietly disagreed about which status a deduped task carries and about what a
+missing config means. **The check script is deleted.** The drift it existed to catch
+cannot occur.
+
+`tnotes` owns: name normalisation (`clean_text` and friends), `parse_note` and its
+regexes, the whole vault reader (`obsidian_lines`, `prefetch`, `die`, the stall
+handling), config loading, the date core, and `cluster_records`/`materialize`. `tcat`
+keeps what is its own: `build_groups`, `dedup`, the theme machinery, rendering, the
+footer, and argparse.
+
+**Where the two tools genuinely differ, the difference is now a parameter rather than
+two copies of a function:**
+
+- **`tn.init(tool)`** names the caller, so every message the module writes is prefixed
+  correctly and `config_paths()` finds `tcat.toml` and `$TCAT_CONFIG`. The environment
+  variables are the *module's* — `TNOTES_WORKERS`, `TNOTES_TIMEOUT`, `TNOTES_DEBUG`,
+  replacing the `TCAT_*` spellings — because they are read at import, before `init()`
+  has been called.
+- **`tn.load_config(…, required=False)`** is what makes no config survivable here.
+  `tdiff` passes `True`: an empty `PROJECT_STATUSES` leaks project headers into every
+  diff, so it cannot degrade. `tcat` runs unranked and uncoloured and says so.
+- **`tn.resolve_date` raises `tn.DateError`** instead of calling `parser.error`. That
+  call is exactly why the function used to sit outside the vendored block and drift: the
+  message belongs to the caller's argument parser, the one thing a shared module cannot
+  own. A four-line local wrapper catches it.
+- **`parse_note` takes `only_days` as well as `skip_days`.** `tcat -W <date>` wants one
+  weekday's allocation; `tdiff` wants everything up to an anchor. Both are the caller's
+  to supply, so neither is a whitelist the module holds.
+- **`tn.status_char()`** reads a status whether the caller stores `'x'` or `'[x]'`.
+  `tdiff` brackets and `tcat` does not; that is a rendering choice each made, and a
+  shared dedup should not have an opinion about it.
+
 
 ## Config
+
+`tn.load_config()` does the work; this section is what `tcat` asks of it.
 
 **Layered, lowest precedence first** — every source *merges* over the ones below it,
 including `$TCAT_CONFIG` and `--config`:
 
-1. `~/.config/obsidian-tasks/statuses.toml` — the shared table
-2. `~/.config/tcat/config.toml` — tcat-only overlay
-3. `$TCAT_CONFIG`
-4. `--config`
+1. `~/.config/tconfig/notation.toml` — how the vault writes things: `[exclude]`, `[days]`, `[vault]`
+2. `~/.config/tconfig/statuses.toml` — what the statuses mean: `[order]`, `[dedup]`, `[roles]`, `[theme.*]`
+3. `~/.config/tconfig/tcat.toml` — tcat-only overrides
+4. `$TCAT_CONFIG`
+5. `--config`
+
+`$TCONFIG_DIR` relocates the folder. If `tconfig/` holds none of the first three, the
+pre-`tconfig` layout — `~/.config/obsidian-tasks/statuses.toml` and
+`~/.config/tcat/config.toml` — is read instead with one notice naming the new home. That
+is a fallback for the first run after the move, not a layer: a `tconfig/` that exists
+wins outright.
+
+**The folder is split by concern, not by tool.** That is the axis along which a file
+actually changes — you rewrite `notation.toml` when you change how you write a note, and
+`statuses.toml` when a status changes meaning. Splitting by tool would have meant writing
+the same section twice and letting the two copies drift, which is the vendoring mistake in
+config form.
 
 **There is no built-in layer, and nothing is ever bootstrapped.** `BUILTIN_ORDER` was
 deleted deliberately: inventing a fallback rank table is exactly how the old build ended
@@ -262,39 +255,38 @@ from code). With no config `tcat` runs unranked and uncoloured and says so via `
 Don't reintroduce a default table in Python — the defaults belong in
 `statuses.example.toml`, which the user owns and edits.
 
-**The shared file sits outside both tool directories on purpose.** The status table
-describes the *vault's* notation, not either tool, so `obsidian-tasks/` is a directory
-neither owns. That is what lets `tcat` and `tdiff` share one table while neither depends on
-the other being installed.
-
-**The sharing is live as of July 2026** — briefly it wasn't, and the file's header claimed
-otherwise, which is worth knowing if you meet an older checkout. `tdiff` now layers the same
-`obsidian-tasks/statuses.toml` beneath its own config and reads `[roles]` from it. The split:
+**The folder sits outside both tool directories on purpose.** It describes the *vault*,
+not either tool, so `tconfig/` is a directory neither owns — which is what lets the two
+share it while neither depends on the other being installed. The split:
 
 | key | read by |
 |---|---|
-| `[order]` display rank, `[theme.*]` colours, `[roles].full_row` | `tcat` |
-| `[dedup].priority` tiers | `tdiff` |
-| `[roles]` `project` / `hide` / `settled` | **both** |
+| `[theme.*]` colours, `[roles].full_row` | `tcat` |
+| `[exclude]`, `[days]`, `[order]`, `[dedup]`, `[roles]` `project`/`hide`/`settled`, `[vault]` | **both** |
+
+`[dedup]` is new to `tcat` here — see **Architecture** step 4. `[exclude]` and `[days]`
+are too: this file used to read neither, because the whitelists in `parse_note` did that
+job in code.
 
 `[order]` and `[dedup]` are deliberately *not* one key. They run opposite ways: `[order]`
 sorts `x` last (finished work belongs at the bottom), `[dedup]` ranks `x` first ("done" is
 the truest thing you can say about a task also written `[/]` on Tuesday). A flat list also
 can't express ties, and `[dedup]` has three.
 
-**`statuses.example.toml` is byte-identical in both repos, on purpose** — installing either
-tool gets the whole table. Keep it that way: `diff` it against `../tdiff/statuses.example.toml`
-before committing a change to it. It is the one file with no sync check, because it isn't
-code.
+**The example files ship once, from `tnotes`** — `notation.example.toml` and
+`statuses.example.toml`. Neither tool carries a copy any more, so there is no pair to keep
+byte-identical and no check to forget. `tcat.example.toml` here documents the overlay
+only.
 
 **Order is a list, not integer ranks.** `[order].statuses` is an ordered list; rank is
 position. Ties are therefore inexpressible (the old table had three) and reordering is a
 move rather than a renumbering. Statuses absent from it get `UNRANKED`, sort last, render
 uncoloured, and are named once on stderr by `report_unlisted()`.
 
-Other keys: `[roles]` `project` / `hide` / `settled` / `full_row`, `[theme.dark]` / `[theme.light]`
-(24-bit hex), `[vault]` folders. Theme choice: `$TCAT_THEME` → `COLORFGBG` → dark.
-Lists replace wholesale; only tables merge (`_merge()`).
+Other keys: `[roles]` `project` / `hide` / `settled` / `full_row`, `[theme.dark]` /
+`[theme.light]` (24-bit hex), `[exclude]` `sections` / `tags`, `[days]` `sunday`..`saturday`,
+`[vault]` folders. Theme choice: `$TCAT_THEME` → `COLORFGBG` → dark. Lists replace
+wholesale; only tables merge (`tn._merge()`).
 
 ## Key behaviours
 
@@ -306,16 +298,13 @@ Lists replace wholesale; only tables merge (`_merge()`).
 | `-I` hides `[roles].settled` | Boolean, like `tdiff`'s — *not* a char list; `-S` already covers that axis. Three filters compose (`hide`, `-I`, `-S`) under one rule: **a positive `-S` wins for the statuses it names**, so `-I -S x` shows done tasks rather than nothing. A negated `-S` names only what to drop, so `-I` still applies to the rest. No built-in set: unconfigured `-I` hides nothing and says so, like `[order].statuses`. |
 | `settled` is not `full_row` | They hold the same two chars by default and are still separate keys: `full_row` says how a row is *painted*, `settled` whether it is *there*. Welding them would make a colour edit silently change which tasks you see. |
 | Empty is never an error | Exit 0, one dim `nothing to show`, whatever the cause. `-v` and the eleven per-reason strings were removed deliberately; don't reinstate them. |
-| Fixa, `future`, `promissum` | Parsed as ladder markers so they can't leak into a day, but **not exposed** — including under a week read. v1 is Actio days only. |
 | Dedup is **scoped**, not global | Each project's children collapse among themselves; bare top-level tasks collapse among themselves as one further scope. The scopes never merge, so a task under two projects keeps a row under each, and a bare occurrence never swallows a project's copy. Until July 2026 the bare scope was skipped entirely: `build_groups()` dropped `seq` for bare rows and the render loop `continue`d past `dedup()`, so top-level duplicates printed twice. Both halves of that fix have to stay — the `seq` is what lets `materialize()` pick a winner. |
-| Dedup spans the whole read | A task on Monday restated on Friday collapses to one row with Friday's status. Falls out of `materialize()`'s last-occurrence rule — but only because the notes are read in order and `seq` is **offset to keep climbing between them**. `parse_note()` restarts `seq` at 1 per call; drop the offset and "last in page order" silently becomes "last in whichever note". Under a bare `w##` the weekly note is read **first**, which is what makes every daily's status beat the plan's. |
+| Dedup spans the whole read | A task on Monday restated on Friday collapses to one row, and `[dedup]` priority picks its status. `seq` is still **offset to keep climbing between notes** — `tn.parse_note()` restarts it at 1 per call — because it is the tie-break within a priority tier; drop the offset and "later in the read" silently becomes "later in whichever note". |
 | A week drops day attribution | Deliberate. `tcat w34` answers *what is in this week*, not *when* — a by-day layout was considered and rejected. `weekday` is `null` in JSON for any week form. No labels, no by-day layout. |
-| A week drops `**future**` | Via `parse_note(skip_future=True)`, passed only for a daily note read *as part of a week*. A day read on its own still shows its future bucket — deferring something is part of that day. See finding 8. |
+| Every note is read whole | Daily and weekly alike, whether read alone or folded into a week. `[exclude] sections` is the only thing that leaves a section out, and it applies everywhere. A week read used to drop a named deferred-work section from each daily, which hardcoded both that such a section exists and what it means. |
 | Colour is marker-only | The whole `[x]` marker, brackets included — tinting only the inner char was tried in July 2026 and reverted; it reads as half-lit. Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
-| Footer is always three fields | `contents · mode · file(s)`, in every mode including `--missio` (whose `contents` is the literal `text`). Projects fold into `contents` rather than taking a field. `--no-summary` drops the whole line, date included. |
+| Footer is always three fields | `contents · mode · file(s)`. Projects fold into `contents` rather than taking a field. `--no-summary` drops the whole line, date included. |
 | The file field names what was read | So `-W` on a date shows the weekly note, not the invoked day; a week names the label plus `(n/7 dailies)`, and `, weekly` too when the weekly note was one of the sources. |
-| `--missio` is verbatim | No link cleaning, no comment stripping, no `strip_section_suffix()`. It's prose, not a task name. Standalone: exits before any task machinery runs, so `-S`/`-I`/`--routines` are ignored — but `-D`/`-W` are **rejected**, since --missio already reads the weekly note and they would have nothing to narrow. |
-| `--missio` JSON is minimal | Exactly `{"week", "missio"}` — deliberately *not* the task envelope. `missio` is `null` for missing note, missing heading, or empty body. |
 
 ## Known gaps
 
@@ -335,19 +324,19 @@ over 2020–2035, exactly 13 weeks change label, all of the form `YYYY-W53` → 
 was **not** changed; label → Sunday → label round-trips under both rules, which is precisely
 why the bug was silent.
 
-The fix landed in `tdiff@e2976c0` first, then here with the pin bump — it must stay joint,
-since all three week functions are vendored. Two consequences worth keeping:
+The fix landed in `tdiff@e2976c0` first and then here, at a time when the week functions
+were vendored in both files and had to move together. They live in `tnotes` now, so this
+class of joint fix has stopped existing. Two consequences worth keeping:
 
-- **The phantom guard is `tcat`-only** and lives at the week-selection call site, not in the
-  vendored block. `w2026-W53` still resolves to a real Sunday, so it is caught by
+- **The phantom guard is `tcat`-only** and lives at the week-selection call site, not in
+  the module. `w2026-W53` still resolves to a real Sunday, so it is caught by
   round-tripping the label through `week_span()` and rejected with a suggestion. Without it
   a user naming a plausible-but-nonexistent week gets silently wrong output.
 - `resolve_week_label('w01')` still stamps `date.today().year`, so a bare `w1` typed in late
   December names *this* year's week 1, not the one about to start. Pre-existing, unrelated
   to this fix, and arguably correct — noted so it isn't mistaken for a regression.
 
-Still outstanding: the Mensis exclusion is unverified (the vault holds no such note), the
-pre-`2026-W20` Sunday contamination under `w## -D` (finding 8), and there is no test suite.
+Still outstanding: there is no test suite.
 
 ## Style
 
