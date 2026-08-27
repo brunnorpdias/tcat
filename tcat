@@ -352,6 +352,12 @@ def daily_name(d):
 # name appears anywhere in this script now.
 NOTE_KW = {}
 
+# Day markers are for the weekly note and nothing else. A daily note carries its date
+# in its filename and nothing inside it allocates a day, so a marker found there could
+# only ever be a false one — and while [days] was a glob, a false one ate the task line
+# it matched. tdiff draws the same line, in weekly_mode().
+WEEKLY_KW = {'day_patterns': tn.DAY_PATTERNS}
+
 if week_arg:
     entries = []
     # The weekly note leads. materialize() keeps the last occurrence in page order and
@@ -359,7 +365,7 @@ if week_arg:
     # statement beat it — the same precedence tdiff gets by giving the weekly note
     # day_index 0 so it loses every tie.
     if not args.dailies:
-        entries.append((WEEKLY_NAME, NOTE_KW))
+        entries.append((WEEKLY_NAME, WEEKLY_KW))
     if not args.weekly:
         entries += [(daily_name((week_sun + timedelta(days=i)).isoformat()), NOTE_KW)
                     for i in range(7)]
@@ -369,8 +375,8 @@ else:
     # shared parse_note. Which lines are markers comes from [days]; with none
     # configured nothing opens a day and this reads empty, which is the honest answer
     # for a vault that does not allocate tasks to days.
-    entries = ([(WEEKLY_NAME, {'only_days': (WEEKDAY_NAME,)})] if args.weekly
-               else [(daily_name(target), NOTE_KW)])
+    entries = ([(WEEKLY_NAME, {**WEEKLY_KW, 'only_days': (WEEKDAY_NAME,)})]
+               if args.weekly else [(daily_name(target), NOTE_KW)])
 
 tn.prefetch([n for n, _ in entries])
 
@@ -388,7 +394,7 @@ for name, kw in entries:
         lines,
         exclude=() if args.show_all else tn.EXCLUDED_SECTIONS,
         exclude_tags=() if args.show_all else tn.EXCLUDED_TAGS,
-        day_patterns=tn.DAY_PATTERNS, **kw))
+        **kw))
     # parse_note restarts seq at 1 every call, so the offset is applied here and
     # advanced by what the note actually yielded. Drop it and "last in page order"
     # quietly becomes "last in whichever note".

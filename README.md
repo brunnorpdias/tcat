@@ -220,9 +220,11 @@ seeing — and a top-level occurrence never swallows a project's copy.
 
 **Links keep their brackets.** A wikilink loses only its folder path
 (`[[folder/note|alias]]` → `[[note|alias]]`); a markdown link reduces to its display text
-(`[text](url)` → `text`). A trailing ` – section` suffix is dropped **before** links are
+(`[text](url)` → `text`). A trailing ` – comment` is dropped **before** links are
 touched, so a linked title containing a dash survives intact — `tcat` used to reduce the
 link first and cut the name at the dash, which is fixed and matches `tdiff` exactly.
+Which characters cut a comment is yours to set in `[comment] separators`, and one only
+counts between spaces and outside every bracket *and* parenthesis.
 
 ### Order
 
@@ -291,11 +293,20 @@ Dedup therefore spans the whole read: a task written on Monday and restated on F
 appears once, and `[dedup]` priority decides which status it carries — so a task written
 `[x]` on Tuesday and `[/]` on Friday reads as done, whichever line came last.
 
+**Restated means restated identically.** Two tasks merge iff their names are the same
+after normalisation, ignoring case — there is no similarity metric. Dedup used to also
+merge names with equal token sets, or where one was a strict token-subset sharing a
+first word, and that made 221 merges across this vault including `purchase coffee`
+swallowing `purchase new coffee grinder`. Nothing separates those from the routine
+merges they look identical to, so the rule went rather than being tuned. A task you
+reworded on Friday is now two rows, which is what the notes actually say.
+
 Every note is read whole, so `w## -W` gives you the whole plan: tasks allocated to a
 weekday marker and tasks allocated to none, which on a week you are still drafting is
 usually all of them. The single-day form (`tcat tuesday -W`) asks the narrower question —
-what is allocated to *that day* — and reads that marker alone, using the globs from
-`[days]`.
+what is allocated to *that day* — and reads that marker alone, using the literals from
+`[days]`. A marker is matched exactly and must be alone on its line, and markers are
+looked for in weekly notes only: a task or a comment that mentions a weekday is not one.
 
 In `--json`, `weekday` is `null` for a week payload and `files` lists exactly which notes
 were read.
@@ -359,7 +370,8 @@ Then edit `notation.toml` to match how you write your notes.
 
 **`notation.toml` — how the vault writes things.** `[exclude] sections` names headings that
 are never read, `[exclude] tags` names tags whose task lines are not really tasks, `[days]`
-says what a weekday marker looks like, `[vault]` pins folder prefixes.
+says what a weekday marker looks like, `[comment] separators` says which characters cut a
+trailing comment off a task name, `[vault]` pins folder prefixes.
 
 **`statuses.toml` — what the statuses mean.** `[order]` display rank, `[dedup]` dedup
 precedence, `[roles]` project/hide/settled/full_row, `[theme.*]` colours.
@@ -411,11 +423,17 @@ What replaced it:
   was 76 phantom rows out of 85. The old argument for ignoring fences was really an
   argument for naming the section, which the exclude list now does. `--all` lifts the
   exclude list for one run and does **not** lift the fence.
-- **`[days]`** says what a weekday marker looks like — a glob per weekday, or a list of
-  them so a vault that has changed notation keeps reading its own history. It is read for
-  one purpose: `tcat <date> -W`, that weekday's allocation. With no `[days]` configured
-  nothing opens a day, so that form reads empty — which is the honest answer for a vault
-  that does not allocate tasks to days.
+- **`[days]`** says what a weekday marker looks like — a **literal** per weekday, or a
+  list of them so a vault that has changed notation keeps reading its own history. It is
+  matched against the whole line and anchored, so the marker must be alone on it, and
+  nothing in a value is a wildcard except `{date}`, which stands for an ISO date. It is
+  read for one purpose: `tcat <date> -W`, that weekday's allocation. With no `[days]`
+  configured nothing opens a day, so that form reads empty — which is the honest answer
+  for a vault that does not allocate tasks to days.
+- **`[comment] separators`** names the characters that cut a trailing comment off a task
+  name, so `- [ ] do blood screening – will complete saturday` is the task
+  `do blood screening`. A separator only counts between spaces and outside every bracket
+  and parenthesis. Name none and nothing is stripped.
 
 An empty result is never an error: no note, no matching section, nothing under a marker —
 all of them print `nothing to show` and exit 0.

@@ -127,9 +127,24 @@ shared module's, and only the seams are described here:
    was written. **No section name appears anywhere in the script now.**
 
    What survives of the ladder is `only_days`, and only to answer `-W <date>`: which
-   weekday's allocation. Which lines are markers comes from `[days]`, a glob per weekday
-   supplied by the vault. With no `[days]` configured nothing opens a day, so `-W` on a
-   date reads empty — the honest answer for a vault that does not allocate tasks to days.
+   weekday's allocation. Which lines are markers comes from `[days]`, a **literal** per
+   weekday supplied by the vault, matched against the whole stripped line and anchored
+   at both ends — so a marker must be alone on its line. `{date}` is the one placeholder
+   and stands for an ISO date; everything else means itself. With no `[days]` configured
+   nothing opens a day, so `-W` on a date reads empty — the honest answer for a vault
+   that does not allocate tasks to days.
+
+   **Markers are looked for in the weekly note and nowhere else.** `WEEKLY_KW` is the
+   only kwarg table that carries `day_patterns`; a daily note gets `NOTE_KW`, which does
+   not. A daily note carries its date in its filename and nothing inside it allocates a
+   day, so a marker found there could only ever be a false one — 240 of them in this
+   vault, back when `day_patterns` rode on every `parse_note` call.
+
+   **And a task line is never a marker**, whatever it says: `parse_note` tests `TASK_RE`
+   first. These were globs until `tdiff` reported `do blood screening` as deleted from a
+   project it had never left — `**saturday**` is `*saturday*` to a glob, so
+   `- [ ] do blood screening – will complete saturday or next week` was consumed as a
+   marker and the task never yielded. 22 tasks were lost that way across this vault.
 
 3. **Group** — `build_groups()` folds flat records into project groups. A top-level
    `[p]`/`[i]`/`[u]` opens a group; indented tasks are its children. Groups **merge**
@@ -139,6 +154,14 @@ shared module's, and only the seams are described here:
 
 4. **Dedup** — `tn.cluster_records()` and `tn.materialize()`, which now reduces a cluster
    by **`[dedup]` priority**, tie-broken by page position.
+
+   **A cluster is now exact.** `cluster_records()` groups by name, case-folded, and
+   nothing else. It used to run union-find over two heuristics — equal token sets, or a
+   strict token-subset sharing a first word — which over this vault made 221 merges
+   including `purchase coffee` swallowing `purchase new coffee grinder` and `essay`
+   swallowing `essay planning`. No threshold separates those from the routine merges
+   they look exactly like, so the rule went rather than being tuned. See `tdiff`'s
+   CLAUDE.md, **Deduplicate**, for the measurements.
 
    **This changed, and it is the one place `tcat`'s output moved for a reason other than
    the fence.** `tcat` used to take the last occurrence in page order outright — the
@@ -229,7 +252,7 @@ two copies of a function:**
 **Layered, lowest precedence first** — every source *merges* over the ones below it,
 including `$TCAT_CONFIG` and `--config`:
 
-1. `~/.config/tconfig/notation.toml` — how the vault writes things: `[exclude]`, `[days]`, `[vault]`
+1. `~/.config/tconfig/notation.toml` — how the vault writes things: `[exclude]`, `[days]`, `[comment]`, `[vault]`
 2. `~/.config/tconfig/statuses.toml` — what the statuses mean: `[order]`, `[dedup]`, `[roles]`, `[theme.*]`
 3. `~/.config/tconfig/tcat.toml` — tcat-only overrides
 4. `$TCAT_CONFIG`
@@ -262,7 +285,7 @@ share it while neither depends on the other being installed. The split:
 | key | read by |
 |---|---|
 | `[theme.*]` colours, `[roles].full_row` | `tcat` |
-| `[exclude]`, `[days]`, `[order]`, `[dedup]`, `[roles]` `project`/`hide`/`settled`, `[vault]` | **both** |
+| `[exclude]`, `[days]`, `[comment]`, `[order]`, `[dedup]`, `[roles]` `project`/`hide`/`settled`, `[vault]` | **both** |
 
 `[dedup]` is new to `tcat` here — see **Architecture** step 4. `[exclude]` and `[days]`
 are too: this file used to read neither, because the whitelists in `parse_note` did that
@@ -285,7 +308,7 @@ uncoloured, and are named once on stderr by `report_unlisted()`.
 
 Other keys: `[roles]` `project` / `hide` / `settled` / `full_row`, `[theme.dark]` /
 `[theme.light]` (24-bit hex), `[exclude]` `sections` / `tags`, `[days]` `sunday`..`saturday`,
-`[vault]` folders. Theme choice: `$TCAT_THEME` → `COLORFGBG` → dark. Lists replace
+`[comment]` `separators`, `[vault]` folders. Theme choice: `$TCAT_THEME` → `COLORFGBG` → dark. Lists replace
 wholesale; only tables merge (`tn._merge()`).
 
 ## Key behaviours
