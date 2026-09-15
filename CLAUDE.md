@@ -58,6 +58,9 @@ scope, the flags pick the source.
 | `tcat w34 -D` | the week's seven daily notes |
 | `tcat w34 -W` | the week's plan, whole |
 
+`--dupes` narrows any of those five to the tasks dedup collapsed. It is a filter over one
+read, not a second grammar and not a comparison — see **Architecture** step 4.
+
 `-D` on a date is a documented no-op — a day's daily note is already the default. It
 exists so the two flags read as a pair rather than as one flag with a gap.
 
@@ -73,6 +76,16 @@ Sibling to `tdiff`. **`tdiff` answers *what changed*; `tcat` answers *what is th
 `tcat` never compares two sources — every comparison stays with `tdiff`. Resist requests
 to add plan-vs-daily columns, drift markers, or diffing of any kind; that is `tdiff`'s job
 and the separation is deliberate.
+
+**`--dupes` is not an exception to that.** It compares nothing: a duplicate is a property
+of a *single* read — the same task written twice in whatever the invocation opened — so the
+answer is still "what is there", with the count of how often. `tdiff` used to own this as
+`-D`/`--dupes` and it was deleted in `596020d` along with `-E`; it lives here now because
+one read is all it ever needed. Its two sigils did not come with it: `!!` (exact repeat)
+versus `~~` (variant wordings) was a distinction fuzzy clustering could draw, and
+`cluster_records` has been exact since `3e11c8b`, so there is one kind of duplicate left.
+**The letter did not come with it either** — `-D` is `--dailies` in both tools now, so
+`--dupes` is long-only rather than a third meaning for that key.
 
 **The seam now lives entirely inside `tdiff`, and `tcat` owes it nothing.** Plan-vs-actual
 is `tdiff today -W`: tdiff reads the weekly note itself, so it no longer needs tcat to
@@ -99,6 +112,7 @@ python3 tcat w30 -W --no-color             # the week as planned
 python3 tcat w0 --no-color                 # this week
 python3 tcat w-1 -D --json                 # last week's dailies
 python3 tcat today --all --no-color        # ignore [exclude]; fences still skipped
+python3 tcat w30 --dupes --no-color        # only what that week wrote more than once
 ```
 
 No test suite — testing is manual via CLI invocation, as in `tdiff`.
@@ -163,6 +177,15 @@ shared module's, and only the seams are described here:
    they look exactly like, so the rule went rather than being tuned. See `tdiff`'s
    CLAUDE.md, **Deduplicate**, for the measurements.
 
+   `dedup()` carries the cluster's members out alongside the winner — every occurrence's
+   status char in page order — because that is what `--dupes` reports, and because the
+   cluster is already in hand. Recovering it later would mean a second clustering pass
+   that could disagree with this one about what a duplicate is. `--dupes` then drops every
+   row whose occurrence list has one entry, **per scope**, so "duplicated" and "collapsed"
+   name the same thing: a task under two projects is two scopes and stays two rows. The
+   count includes occurrences the `hide`/`-I`/`-S` filters would drop, since those run
+   after dedup.
+
    **This changed, and it is the one place `tcat`'s output moved for a reason other than
    the fence.** `tcat` used to take the last occurrence in page order outright — the
    reasonable-sounding rule that the latest statement is the current one. It was also the
@@ -185,6 +208,11 @@ shared module's, and only the seams are described here:
    `--flat`'s private alphabetical sort silently had. `row()` colours the status marker
    only, except for `FULL_ROW` statuses (`x`, `-`) which take the colour across the whole
    line; `footer()` emits the single context line, always `contents · mode · file(s)`.
+   `dup_trail()` appends `--dupes`'s `×n` and occurrence statuses, dim and after the name:
+   the row is still the answer, the trail is only why it survived the filter. It names no
+   note — a week drops day attribution everywhere else, and for the same reason here. In
+   the footer `--dupes` changes the noun in `contents` and nothing else, because `mode`
+   names what was *read* and a filter is not a different read.
 
 6. **Read plan** — one ordered list of `(note, parse kwargs)` built from the scope the
    positional named and the source `-D`/`-W` asked for, consumed by one loop. It is the
@@ -216,11 +244,24 @@ two tools quietly disagreed about which status a deduped task carries and about 
 missing config means. **The check script is deleted.** The drift it existed to catch
 cannot occur.
 
-`tnotes` owns: name normalisation (`clean_text` and friends), `parse_note` and its
+`tnotes` owns: name normalisation (`clean_text` and friends, plus the print-time
+`display_text`), `parse_note` and its
 regexes, the whole vault reader (`obsidian_lines`, `prefetch`, `die`, the stall
 handling), config loading, the date core, and `cluster_records`/`materialize`. `tcat`
 keeps what is its own: `build_groups`, `dedup`, the theme machinery, rendering, the
 footer, and argparse.
+
+**`display_text` is normalisation's print-time half, and calling it anywhere else is a
+bug.** It collapses an aliased wikilink to its alias in a *single* bracket
+(`[[…bodner ⟦book⟧.pdf|learning go (5/15) – functions]]` → `[learning go (5/15) –
+functions]`) and leaves an unaliased one alone. The alias is the vault already saying in
+its own words what the target is, and the target is the long half — a reading list
+printed as a wall of identical PDF filenames is what prompted this. One bracket because
+the printed text is no longer a link; a double bracket therefore means the name really
+is the link. But an alias is display text and two notes may share one, which is exactly
+why `normalize_wikilinks` keeps the target: collapsing before `dedup` would claim two
+tasks are one. `row()` is the only caller here, `render()` and the project header in
+`tdiff`, and `--json` reports the canonical name.
 
 **Where the two tools genuinely differ, the difference is now a parameter rather than
 two copies of a function:**
@@ -323,6 +364,7 @@ wholesale; only tables merge (`tn._merge()`).
 | Empty is never an error | Exit 0, one dim `nothing to show`, whatever the cause. `-v` and the eleven per-reason strings were removed deliberately; don't reinstate them. |
 | Dedup is **scoped**, not global | Each project's children collapse among themselves; bare top-level tasks collapse among themselves as one further scope. The scopes never merge, so a task under two projects keeps a row under each, and a bare occurrence never swallows a project's copy. Until July 2026 the bare scope was skipped entirely: `build_groups()` dropped `seq` for bare rows and the render loop `continue`d past `dedup()`, so top-level duplicates printed twice. Both halves of that fix have to stay — the `seq` is what lets `materialize()` pick a winner. |
 | Dedup spans the whole read | A task on Monday restated on Friday collapses to one row, and `[dedup]` priority picks its status. `seq` is still **offset to keep climbing between notes** — `tn.parse_note()` restarts it at 1 per call — because it is the tie-break within a priority tier; drop the offset and "later in the read" silently becomes "later in whichever note". |
+| `--dupes` filters, it doesn't compare | Only the rows dedup collapsed, each with `×n` and every occurrence's status in page order. Same scoping as dedup, so a task under two projects is two rows and neither is a duplicate. In `--json` the row gains `count` and `statuses` **only** under the flag — otherwise every row would carry a `count` of 1 — and the payload gains `dupes`. `mode` still names the read. |
 | A week drops day attribution | Deliberate. `tcat w34` answers *what is in this week*, not *when* — a by-day layout was considered and rejected. `weekday` is `null` in JSON for any week form. No labels, no by-day layout. |
 | Every note is read whole | Daily and weekly alike, whether read alone or folded into a week. `[exclude] sections` is the only thing that leaves a section out, and it applies everywhere. A week read used to drop a named deferred-work section from each daily, which hardcoded both that such a section exists and what it means. |
 | Colour is marker-only | The whole `[x]` marker, brackets included — tinting only the inner char was tried in July 2026 and reverted; it reads as half-lit. Except `FULL_ROW` (`x`, `-`), which colour the whole row. Two signals: grey marker = deprioritised but open, grey line = settled. |
@@ -331,7 +373,9 @@ wholesale; only tables merge (`tn._merge()`).
 
 ## Known gaps
 
-See the **Known gaps** section of `README.md`.
+`README.md` is a user's guide now, not a second copy of this file: it says what the tool
+does and how to configure it, and every *argument* for why lives here. Keep it that way —
+when behaviour changes, the guide gets the new fact and this file gets the reasoning.
 
 ### Weeks across a year boundary — FIXED July 2026, joint with `tdiff`
 

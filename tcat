@@ -65,18 +65,37 @@ def build_groups(note_records):
     return tops
 
 def dedup(items):
-    """Reduce (status, name, seq) triples to one (status, name) per logical task.
+    """Reduce (status, name, seq) triples to one (status, name, occurrences) per
+    logical task.
 
-    A cluster's *last* member decides the status: within one note the last statement is
-    the current one, and across a week the last note to mention a task has the latest
-    word on it. `seq` says which member that is, which is why it survives even though
-    nothing downstream reads a position any more.
+    The winner comes from `[dedup]` priority, tie-broken by page position — that is
+    `tn.materialize`'s rule, shared with `tdiff`, and `seq` is what supplies the
+    tie-break.
+
+    `occurrences` is every member's status char in page order, so its length is how
+    many times the task was written. It costs nothing to carry — the cluster is
+    already in hand — and it is what `--dupes` reports; recovering it with a second
+    clustering pass would risk a pass that disagreed with this one about what a
+    duplicate is.
     """
     if not items:
         return []
     clusters = tn.cluster_records([(n, s, q) for s, n, q in items])
     tasks, order = tn.materialize(clusters)
-    return [(tasks[n], n) for n in order]
+    # materialize() emits one canonical name per cluster, in cluster order, so the two
+    # lists line up positionally — which is how a row keeps hold of its own members.
+    return [(tasks[n], n, [st for _, st, _ in members])
+            for n, members in zip(order, clusters)]
+
+def dup_only(entries):
+    """With --dupes, narrow a scope to the tasks dedup actually collapsed.
+
+    It runs per scope, on the triples `dedup()` just returned, so "duplicated" means
+    exactly what "collapsed" means. A task written under two projects is two scopes
+    and keeps two rows, and is no more a duplicate here than it is anywhere else.
+    """
+    entries = list(entries)
+    return [e for e in entries if len(e[2]) > 1] if args.dupes else entries
 
 def sort_key(status, name):
     return (tn.display_rank(status), name.lower())
@@ -123,6 +142,13 @@ parser.add_argument('-I', '--ignore',   action='store_true',
                          '(done, cancelled, overrun, postponed, advanced) — leaving only '
                          'what is still open. Composes with -S, which wins for any '
                          'status it names outright')
+# No short letter on purpose. tdiff spelled its old dupes mode -D, which now means
+# --dailies in both tools; reusing the letter would reintroduce exactly the cross-tool
+# collision -P and -A were removed to end.
+parser.add_argument('--dupes',          action='store_true',
+                    help='show only tasks written more than once in whatever this '
+                         'invocation read, each with a count and the status of every '
+                         'occurrence. Duplicates are per scope, as dedup is')
 parser.add_argument('--all',            action='store_true', dest='show_all',
                     help='ignore the whole [exclude] table, sections and tags alike; '
                          'fenced blocks are still skipped')
@@ -287,13 +313,31 @@ def row(status, name, indent):
     The exception is `full_row` (done, cancelled): those take the colour across
     the whole line, so grey carries two distinct signals — a grey marker means
     deprioritised but open, a grey line means settled.
+
+    `tn.display_text` runs here and nowhere earlier: it collapses an aliased
+    wikilink to its alias, a name two notes may share, so a row carrying it into
+    dedup could claim two tasks are one. `--json` keeps the canonical name.
     """
+    name = tn.display_text(name)
     c = STATUS_SGR.get(status, '')
     if not c:
         return f'{indent}[{status}] {name}'
     if status in tn.FULL_ROW:
         return f'{indent}{c}[{status}] {name}{RESET}'
     return f'{indent}{c}[{status}]{RESET} {name}'
+
+def dup_trail(occ):
+    """What --dupes adds to a row: how many times the task was written, and which
+    status each occurrence carried, in page order.
+
+    Dim, and after the name, because the row is still the answer — the trail is only
+    the evidence for why the row survived the filter. It does not say *which* note
+    each occurrence came from: a week drops day attribution everywhere else in this
+    tool, and the same reason holds here.
+    """
+    if not args.dupes or not occ or len(occ) < 2:
+        return ''
+    return f'  {DIM}×{len(occ)}  ' + ' '.join(f'[{s}]' for s in occ) + RESET
 
 def footer(contents, mode, note_field):
     """The one line of context, always `contents · mode · file(s)`."""
@@ -423,45 +467,60 @@ else:
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
 
-# (status, name, children) — children None for a bare task. Output is always grouped
-# and always ordered by [order].statuses then name; structure and order stopped being
-# flags because neither had a second setting worth keeping.
+# A row is (status, name, children, occurrences): children is None for a bare task, and
+# occurrences is None for a project header — a header is context, never a task, so it is
+# never clustered and cannot be duplicated. Output is always grouped and always ordered
+# by [order].statuses then name; structure and order stopped being flags because neither
+# had a second setting worth keeping.
 #
 # Dedup is scoped, and the scopes never merge into one another: every project's
 # children collapse among themselves, and the bare tasks collapse among themselves.
 # So a task written under two projects keeps a row under each — the header is real
 # context — and a bare occurrence never swallows a project's copy. Bare tasks are
 # collected rather than emitted inline because dedup needs the whole scope at once.
+# --dupes runs inside each of those scopes, on what that scope collapsed, so it inherits
+# the same rule: two projects, two rows, neither of them a duplicate.
 rows = []
 bare = []
-for status, name, children, _ in build_groups(note_records):
+for status, name, children, seq in build_groups(note_records):
     if children is None:
-        bare.append((status, name, _))
+        bare.append((status, name, seq))
         continue
-    kids = [k for k in dedup(children) if status_match(k[0])]
+    kids = dup_only(k for k in dedup(children) if status_match(k[0]))
     order_rows(kids)
     # A project whose every child was filtered out is not worth a header.
     if kids:
-        rows.append((status, name, kids))
-for status, name in dedup(bare):
+        rows.append((status, name, kids, None))
+for status, name, occ in dup_only(dedup(bare)):
     if status_match(status):
-        rows.append((status, name, None))
+        rows.append((status, name, None, occ))
 order_rows(rows)
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
+def dup_json(rec, occ):
+    """--dupes puts the same evidence in the payload: the count, and the status of
+    each occurrence in page order. Only under --dupes — every row of a default run
+    would otherwise carry a `count` of 1, which is noise in the common case."""
+    if args.dupes:
+        rec['count'] = len(occ)
+        rec['statuses'] = list(occ)
+    return rec
+
 if args.json:
     json_rows = []
-    for _s, _n, _k in rows:
+    for _s, _n, _k, _o in rows:
         if _k is None:
-            json_rows.append({'status': _s, 'name': _n})
+            json_rows.append(dup_json({'status': _s, 'name': _n}, _o))
             continue
         # A project header is context, not work: it survives as the `project` key on
         # its children rather than as a row of its own. Same as tdiff.
-        for _cs, _cn in _k:
-            json_rows.append({'status': _cs, 'name': _cn, 'project': _n})
+        for _cs, _cn, _co in _k:
+            json_rows.append(dup_json({'status': _cs, 'name': _cn, 'project': _n}, _co))
     print(json.dumps({
         'mode': mode,
+        # A filter on the rows, not a mode of its own: `mode` still names what was read.
+        'dupes': args.dupes,
         'date': target,
         # A week spans seven days, so no single weekday describes the payload.
         'weekday': None if week_arg else WEEKDAY_NAME,
@@ -476,15 +535,15 @@ if args.json:
 
 leaves = 0
 seen_statuses = set()
-for status, name, kids in rows:
+for status, name, kids, occ in rows:
     seen_statuses.add(status)
-    print(row(status, name, '  '))
+    print(row(status, name, '  ') + dup_trail(occ))
     if kids is None:
         leaves += 1
         continue
-    for cs, cn in kids:
+    for cs, cn, cocc in kids:
         seen_statuses.add(cs)
-        print(row(cs, cn, '      '))
+        print(row(cs, cn, '      ') + dup_trail(cocc))
         leaves += 1
 
 if not rows:
@@ -495,8 +554,11 @@ if not rows:
 report_unlisted(seen_statuses)
 
 if not args.no_summary:
-    groups = sum(1 for _, _, k in rows if k is not None)
-    contents = f"{leaves} task" + ('' if leaves == 1 else 's')
+    groups = sum(1 for _, _, k, _o in rows if k is not None)
+    # The noun is the only place --dupes shows in the footer: `mode` names what was
+    # read, and a filter is not a different read.
+    noun = 'duplicated task' if args.dupes else 'task'
+    contents = f"{leaves} {noun}" + ('' if leaves == 1 else 's')
     if groups:
         # Projects join `contents` rather than taking a field of their own, so the
         # footer is always exactly three fields wide.
